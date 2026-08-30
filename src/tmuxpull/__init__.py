@@ -84,11 +84,11 @@ class Result:
     def summary_line(self) -> str:
         if not self.ok:
             tail = (self.stderr.strip().splitlines() or [f"exit {self.returncode}"])[-1]
-            return f"✗ FAIL: {tail}"
+            return f"! FAIL: {tail}"
         if not self.changed:
-            return "· up to date"
+            return "= up to date"
         n = len(self.log_lines)
-        return f"✓ {n} commit{'s' if n != 1 else ''}  {self.shortstat}".rstrip()
+        return f"+ {n} commit{'s' if n != 1 else ''}  {self.shortstat}".rstrip()
 
 
 # --------------------------------------------------------------------------- #
@@ -259,26 +259,31 @@ def open_repo_session(server: libtmux.Server, r: Result) -> str:
 # --------------------------------------------------------------------------- #
 
 
-async def _run(repos: list[Repo], jobs: int) -> list[Result]:
+async def _run(repos: list[Repo], jobs: int, verbose: int) -> list[Result]:
+    """Rebase all repos concurrently, printing each result AS IT COMPLETES.
+
+    Output is in completion order (not input order) so the user sees live
+    progress; each line is prefixed with an [n/N] counter.
+    """
     sem = asyncio.Semaphore(jobs)
-    return await asyncio.gather(*(rebase(r, sem) for r in repos))
+    width = max((len(r.name) for r in repos), default=0)
+    total = len(repos)
+    results: list[Result] = []
 
-
-def _print_report(results: list[Result], verbose: int) -> int:
-    fails = 0
-    width = max((len(r.repo.name) for r in results), default=0)
-    for r in results:
+    tasks = [asyncio.create_task(rebase(r, sem)) for r in repos]
+    for done, task in enumerate(asyncio.as_completed(tasks), start=1):
+        r = await task
         stream = sys.stdout if r.ok else sys.stderr
-        print(f"{r.repo.name:<{width}}  {r.summary_line()}", file=stream)
+        counter = f"[{done}/{total}]"
+        print(f"{counter:>9} {r.repo.name:<{width}}  {r.summary_line()}", file=stream, flush=True)
         if verbose > 0 and r.changed:
             preview = r.log_lines if verbose > 1 else r.log_lines[:3]
             for ln in preview:
-                print(f"  {ln}", file=stream)
+                print(f"{'':>9} {ln}", file=stream, flush=True)
             if verbose <= 1 and len(r.log_lines) > 3:
-                print(f"  ... +{len(r.log_lines) - 3} more", file=stream)
-        if not r.ok:
-            fails += 1
-    return fails
+                print(f"{'':>9} ... +{len(r.log_lines) - 3} more", file=stream, flush=True)
+        results.append(r)
+    return results
 
 
 def main() -> None:
@@ -348,8 +353,8 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    results = asyncio.run(_run(repos, args.jobs))
-    fails = _print_report(results, args.verbose)
+    results = asyncio.run(_run(repos, args.jobs, args.verbose))
+    fails = sum(1 for r in results if not r.ok)
 
     tmux_wanted = args.tmux == "on"
     if tmux_wanted and shutil.which("tmux") is None:

@@ -25,6 +25,10 @@ run = "uv run ruff format ."
 description = "Build package"
 run = "uv build"
 
+[tasks.gen-script]
+description = "Regenerate bin/rebase-all.py from src/tmuxpull/__init__.py"
+run = "python scripts/gen_script.py"
+
 [tasks.clean]
 description = "Clean build artifacts"
 run = ["rm -rf dist/", "rm -rf src/tmuxpull.egg-info/"]

@@ -92,20 +92,28 @@ Failed repos open tmux windows in the "rebase" session (or `-s NAME`), landing o
 
 ## Two Versions
 
-### `bin/rebase-all.py` (Recommended)
+### `src/tmuxpull/` + `bin/rebase-all.py` (single source of truth)
 
-- **Standard Python package** with proper console script entry point
+The PyPI package (`src/tmuxpull/__init__.py`) is the canonical implementation.
+`bin/rebase-all.py` — the standalone PEP 723 script the curl one-liners use — is
+**generated from it** (`python scripts/gen_script.py`, or `mise run gen-script`);
+a test fails if the two drift, so they always ship identical behavior.
+
 - Rich per-repo summaries with git log output and diffstat
-- Better error handling and progress reporting
+- Better error handling and live progress reporting
 - Structured data model for repo state
 
-**Requirements**: Python 3.11+, tmux, git
+**Requirements**: Python 3.11+, tmux, git (plus [uv](https://docs.astral.sh/uv/) for the standalone script)
 
 ### `bin/rebase-all` (Fallback)
 
 - **Pure Zsh** — no Python dependencies
 - Basic summaries (commit count only, no diffstat)
 - Simpler concurrency model with job control
+
+> **Note on drift**: the Zsh script is a deliberately simpler port and is NOT
+> kept feature-identical with the Python version. Expect it to lag behind —
+> it exists for machines where installing Python/uv isn't worth it.
 
 **Requirements**: Zsh, tmux, git
 

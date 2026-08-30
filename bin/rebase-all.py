@@ -5,19 +5,16 @@
 #   "libtmux>=0.35",
 # ]
 # ///
+# GENERATED FILE -- do not edit directly.
+# Source of truth: src/tmuxpull/__init__.py
+# Regenerate with: python scripts/gen_script.py
 """
-rebase-all -- run `git pull --rebase --autostash` across every Git repo under
+tmuxpull -- run `git pull --rebase --autostash` across every Git repo under
 the given roots, concurrently. Print a per-repo summary of what changed, and
-open a tmux window per repo that needs attention (rebase failed, conflict
-in progress, or a stash was left behind) landing on `git status` in the repo.
+create a dedicated tmux session per repo with a rebase window showing `git status`.
 
 Usage:
-    rebase-all.py [-d DEPTH] [-j JOBS] [--tmux {all,attn,off}]
-                  [-s SESSION] [-v] [--dry-run] DIR [DIR ...]
-
-The shebang uses uv (https://docs.astral.sh/uv/); the /// script block below
-is PEP 723 inline metadata. `chmod +x rebase-all.py && ./rebase-all.py ...`
-just works on any machine with uv installed; no venv, no pip install.
+    tmuxpull [-d DEPTH] [-j JOBS] [--tmux {on,off}] [-v] [--dry-run] DIR [DIR ...]
 """
 from __future__ import annotations
 
@@ -53,8 +50,8 @@ _SKIP_DIRS: frozenset[str] = frozenset(
     }
 )
 
-# tmux session and window names cannot contain ':' or '.' and shouldn't carry
-# whitespace. Replace with '_'.
+# tmux session names cannot contain ':' or '.' but allow '/'. 
+# Use Unix-style paths since tmux runs in Unix-like environments.
 _UNSAFE_TMUX = re.compile(r"[:.\s]")
 
 
@@ -97,11 +94,11 @@ class Result:
     def summary_line(self) -> str:
         if not self.ok:
             tail = (self.stderr.strip().splitlines() or [f"exit {self.returncode}"])[-1]
-            return f"✗ FAIL: {tail}"
+            return f"! FAIL: {tail}"
         if not self.changed:
-            return "· up to date"
+            return "= up to date"
         n = len(self.log_lines)
-        return f"✓ {n} commit{'s' if n != 1 else ''}  {self.shortstat}".rstrip()
+        return f"+ {n} commit{'s' if n != 1 else ''}  {self.shortstat}".rstrip()
 
 
 # --------------------------------------------------------------------------- #
@@ -208,27 +205,63 @@ def _sanitize(name: str) -> str:
     return _UNSAFE_TMUX.sub("_", name) or "rebase"
 
 
-def open_pane(server: libtmux.Server, session_name: str, r: Result) -> None:
-    """Ensure a tmux session exists and open a window in it rooted at r.repo.
+def _make_session_name(repo: Repo) -> str:
+    """Create a tmux session name that looks like a Unix path to the repo."""
+    parent = repo.path.parent.name
+    repo_name = repo.path.name
+    
+    # Handle edge cases
+    if not parent or parent == "/":
+        session_name = repo_name
+    else:
+        # Use Unix-style forward slash (tmux runs in Unix-like environments)
+        session_name = f"{parent}/{repo_name}"
+    
+    return _sanitize(session_name)
 
-    The window lands on `git status` so a failed rebase is immediately visible.
+
+def open_repo_session(server: libtmux.Server, r: Result) -> str:
+    """Create or update a tmux session for a specific repo.
+    
+    Returns the session name for user reference.
     """
-    win = _sanitize(r.repo.name)
+    session_name = _make_session_name(r.repo)
+    window_name = "rebase"
+    
+    # Try to get existing session
     sess = server.sessions.get(session_name=session_name, default=None)
+    
     if sess is None:
+        # Create new session with rebase as the first window
         sess = server.new_session(
             session_name=session_name,
-            window_name=win,
+            window_name=window_name,
             start_directory=str(r.repo.path),
             attach=False,
         )
         pane = sess.active_pane
     else:
+        # Session exists, add a new rebase window
+        # Check if rebase window already exists
+        existing_rebase = None
+        for window in sess.windows:
+            if window.name == window_name:
+                existing_rebase = window
+                break
+        
+        if existing_rebase:
+            # Rebase window exists, make it unique with timestamp
+            import time
+            window_name = f"rebase-{int(time.time()) % 10000}"
+        
         pane = sess.new_window(
-            window_name=win,
+            window_name=window_name,
             start_directory=str(r.repo.path),
         ).active_pane
+    
+    # Always land on git status to show current state
     pane.send_keys("git status")
+    return session_name
 
 
 # --------------------------------------------------------------------------- #
@@ -236,35 +269,40 @@ def open_pane(server: libtmux.Server, session_name: str, r: Result) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def _run(repos: list[Repo], jobs: int) -> list[Result]:
+async def _run(repos: list[Repo], jobs: int, verbose: int) -> list[Result]:
+    """Rebase all repos concurrently, printing each result AS IT COMPLETES.
+
+    Output is in completion order (not input order) so the user sees live
+    progress; each line is prefixed with an [n/N] counter.
+    """
     sem = asyncio.Semaphore(jobs)
-    return await asyncio.gather(*(rebase(r, sem) for r in repos))
+    width = max((len(r.name) for r in repos), default=0)
+    total = len(repos)
+    results: list[Result] = []
 
-
-def _print_report(results: list[Result], verbose: int) -> int:
-    fails = 0
-    width = max((len(r.repo.name) for r in results), default=0)
-    for r in results:
+    tasks = [asyncio.create_task(rebase(r, sem)) for r in repos]
+    for done, task in enumerate(asyncio.as_completed(tasks), start=1):
+        r = await task
         stream = sys.stdout if r.ok else sys.stderr
-        print(f"{r.repo.name:<{width}}  {r.summary_line()}", file=stream)
+        counter = f"[{done}/{total}]"
+        print(f"{counter:>9} {r.repo.name:<{width}}  {r.summary_line()}", file=stream, flush=True)
         if verbose > 0 and r.changed:
             preview = r.log_lines if verbose > 1 else r.log_lines[:3]
             for ln in preview:
-                print(f"  {ln}", file=stream)
+                print(f"{'':>9} {ln}", file=stream, flush=True)
             if verbose <= 1 and len(r.log_lines) > 3:
-                print(f"  ... +{len(r.log_lines) - 3} more", file=stream)
-        if not r.ok:
-            fails += 1
-    return fails
+                print(f"{'':>9} ... +{len(r.log_lines) - 3} more", file=stream, flush=True)
+        results.append(r)
+    return results
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        prog="rebase-all.py",
+        prog="tmuxpull",
         description=(
             "Concurrently `git pull --rebase --autostash` every Git repo under the "
-            "given roots. Print a per-repo summary of what changed, and open a tmux "
-            "window per repo that needs your attention."
+            "given roots. Print a per-repo summary of what changed, and create a "
+            "dedicated tmux session per repo with a rebase window."
         ),
     )
     ap.add_argument(
@@ -285,16 +323,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--tmux",
-        choices=("all", "attn", "off"),
-        default="attn",
-        help="Open tmux windows for: all repos, only ones needing attention (default), or none.",
+        choices=("on", "off"),
+        default="on",
+        help="Create tmux sessions: on (default) or off.",
     )
-    ap.add_argument(
-        "-s",
-        "--session",
-        default="rebase",
-        help="tmux session name (default: 'rebase').",
-    )
+
     ap.add_argument(
         "-v",
         "--verbose",
@@ -330,30 +363,26 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    results = asyncio.run(_run(repos, args.jobs))
-    fails = _print_report(results, args.verbose)
+    results = asyncio.run(_run(repos, args.jobs, args.verbose))
+    fails = sum(1 for r in results if not r.ok)
 
-    tmux_wanted = args.tmux != "off"
+    tmux_wanted = args.tmux == "on"
     if tmux_wanted and shutil.which("tmux") is None:
-        print("tmux not on PATH; skipping windows", file=sys.stderr)
+        print("tmux not on PATH; skipping sessions", file=sys.stderr)
     elif tmux_wanted:
         server = libtmux.Server()
-        session = _sanitize(args.session)
-        opened = 0
+        session_names = []
+        
         for r in results:
-            if args.tmux == "attn" and not r.needs_attention:
-                continue
-            open_pane(server, session, r)
-            opened += 1
-        if opened:
-            print(
-                f"\n{opened} tmux window{'s' if opened != 1 else ''} in session "
-                f"'{session}'.  attach: tmux attach -t {session}",
-                file=sys.stderr,
-            )
+            session_name = open_repo_session(server, r)
+            session_names.append(session_name)
+        
+        if session_names:
+            print(f"\n{len(session_names)} tmux session(s) created:", file=sys.stderr)
+            for name in sorted(set(session_names)):
+                print(f"  tmux attach -t {name}", file=sys.stderr)
 
     sys.exit(1 if fails else 0)
-
 
 if __name__ == "__main__":
     main()
