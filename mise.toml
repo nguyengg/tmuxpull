@@ -1,0 +1,30 @@
+[tools]
+python = "3.12"
+uv = "latest"
+
+[env]
+PYTHONPATH = "src"
+
+[tasks.install]
+description = "Install dependencies for development"
+run = "uv sync --dev"
+
+[tasks.test]
+description = "Run tests with pytest"
+run = "uv run pytest"
+
+[tasks.lint]
+description = "Run linting with ruff"
+run = "uv run ruff check ."
+
+[tasks.format]
+description = "Format code with ruff"
+run = "uv run ruff format ."
+
+[tasks.build]
+description = "Build package"
+run = "uv build"
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = ["rm -rf dist/", "rm -rf src/tmuxpull.egg-info/"]

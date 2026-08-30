@@ -1,0 +1,199 @@
+#!/bin/zsh
+# rebase-all -- concurrent git pull --rebase --autostash with tmux attention windows
+#
+# Zsh fallback for machines without Python/uv. For the full-featured version,
+# use rebase-all.py (PEP 723 single-file with libtmux, git log summaries, etc.).
+#
+# Usage: rebase-all [-j JOBS] [-d DEPTH] [-s SESSION] [--dry-run] DIR [DIR...]
+
+set -euo pipefail
+
+# defaults
+max_depth=2
+jobs=8
+session="rebase"
+dry_run=false
+tmux_mode="attn"  # all | attn | off
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: rebase-all [-j JOBS] [-d DEPTH] [-s SESSION] [--dry-run] DIR [DIR...]
+
+Options:
+  -j JOBS      Max concurrent rebases (default: 8)
+  -d DEPTH     Directory search depth (default: 2)  
+  -s SESSION   tmux session name (default: rebase)
+  --tmux MODE  Open tmux windows for: all repos, attn (default), or off
+  --dry-run    List repos and exit
+  -h, --help   Show this help
+
+Examples:
+  rebase-all ~/Workspaces
+  rebase-all -j 4 --tmux all ~/Projects ~/Work
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -j) jobs=$2; shift 2 ;;
+        -d) max_depth=$2; shift 2 ;;
+        -s) session=$2; shift 2 ;;
+        --tmux) tmux_mode=$2; shift 2 ;;
+        --dry-run) dry_run=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        *) break ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    echo "Error: no directories specified" >&2
+    usage
+    exit 1
+fi
+
+# find repos
+repos=()
+for root in "$@"; do
+    if [[ ! -d "$root" ]]; then
+        echo "skip: $root is not a directory" >&2
+        continue
+    fi
+    
+    # find .git dirs, respecting max_depth and skipping noise dirs
+    while IFS= read -r -d '' gitdir; do
+        repo="${gitdir%/.git}"
+        repos+=("$repo")
+    done < <(find "$root" -mindepth 1 -maxdepth $((max_depth + 1)) \
+                -name ".git" -type d \
+                -not -path "*/node_modules/*" \
+                -not -path "*/.venv/*" \
+                -not -path "*/venv/*" \
+                -not -path "*/target/*" \
+                -not -path "*/build/*" \
+                -not -path "*/dist/*" \
+                -not -path "*/__pycache__/*" \
+                -print0 2>/dev/null)
+done
+
+if [[ ${#repos[@]} -eq 0 ]]; then
+    echo "no git repos found" >&2
+    exit 1
+fi
+
+if [[ "$dry_run" == "true" ]]; then
+    printf '%s\n' "${repos[@]}"
+    exit 0
+fi
+
+echo "rebasing ${#repos[@]} repo(s) (jobs=$jobs)..." >&2
+
+# set up temp dir for per-repo status files
+tmpdir=$(mktemp -d)
+trap "rm -rf $tmpdir" EXIT
+
+# concurrent rebase function
+rebase_one() {
+    local repo=$1
+    local slug=${repo//\//_}  # sanitize path for filename
+    local old_sha new_sha
+    
+    cd "$repo"
+    old_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+    
+    if git pull --rebase --autostash >"$tmpdir/$slug.out" 2>"$tmpdir/$slug.err"; then
+        echo "0" > "$tmpdir/$slug.status"
+        new_sha=$(git rev-parse HEAD 2>/dev/null || echo "$old_sha")
+        
+        # simple change detection
+        if [[ -n "$old_sha" && "$old_sha" != "$new_sha" ]]; then
+            local count=$(git rev-list --count "$old_sha..$new_sha" 2>/dev/null || echo "0")
+            echo "✓ $count commit(s)" > "$tmpdir/$slug.summary"
+        else
+            echo "· up to date" > "$tmpdir/$slug.summary"
+        fi
+    else
+        local rc=$?
+        echo "$rc" > "$tmpdir/$slug.status"
+        local err_tail=$(tail -n1 "$tmpdir/$slug.err" 2>/dev/null || echo "exit $rc")
+        echo "✗ FAIL: $err_tail" > "$tmpdir/$slug.summary"
+    fi
+}
+
+# fan out work with job control
+pids=()
+for repo in "${repos[@]}"; do
+    rebase_one "$repo" &
+    pids+=($!)
+    
+    # wait for a slot if we're at the job limit
+    if (( ${#pids[@]} >= jobs )); then
+        wait -n  # wait for next job to complete (zsh 5.9+, bash 4.3+)
+        # rebuild pids array without completed jobs
+        local new_pids=()
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                new_pids+=("$pid")
+            fi
+        done
+        pids=("${new_pids[@]}")
+    fi
+done
+
+# wait for remaining jobs
+wait
+
+# collect results and print report
+fails=0
+needs_attention=()
+
+# find max repo name length for alignment
+max_width=0
+for repo in "${repos[@]}"; do
+    local name=${repo##*/}  # basename
+    (( ${#name} > max_width )) && max_width=${#name}
+done
+
+for repo in "${repos[@]}"; do
+    local slug=${repo//\//_}
+    local name=${repo##*/}
+    local status=$(cat "$tmpdir/$slug.status" 2>/dev/null || echo "999")
+    local summary=$(cat "$tmpdir/$slug.summary" 2>/dev/null || echo "unknown")
+    
+    printf "%-${max_width}s  %s\n" "$name" "$summary"
+    
+    if [[ "$status" != "0" ]]; then
+        (( fails++ ))
+        needs_attention+=("$repo")
+    fi
+done
+
+# open tmux windows for repos needing attention
+if [[ "$tmux_mode" != "off" ]] && command -v tmux >/dev/null; then
+    opened=0
+    target_repos=()
+    
+    case "$tmux_mode" in
+        all) target_repos=("${repos[@]}") ;;
+        attn) target_repos=("${needs_attention[@]}") ;;
+    esac
+    
+    for repo in "${target_repos[@]}"; do
+        local win_name=${repo##*/}  # basename
+        local clean_name=${win_name//[: .]/_}  # sanitize for tmux
+        
+        if tmux has-session -t "$session" 2>/dev/null; then
+            tmux new-window -t "$session:" -n "$clean_name" -c "$repo" \; send-keys 'git status' Enter
+        else
+            tmux new-session -d -s "$session" -n "$clean_name" -c "$repo" \; send-keys 'git status' Enter
+        fi
+        (( opened++ ))
+    done
+    
+    if (( opened > 0 )); then
+        echo >&2
+        echo "$opened tmux window(s) in session '$session'.  attach: tmux attach -t $session" >&2
+    fi
+fi
+
+exit $((fails > 0 ? 1 : 0))
