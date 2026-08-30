@@ -4,6 +4,28 @@ Concurrent `git pull --rebase --autostash` across multiple Git repositories with
 
 ## Quick Start
 
+### Run instantly with curl (no install)
+
+```bash
+# Python version — requires uv (https://docs.astral.sh/uv/)
+curl -fsSL https://raw.githubusercontent.com/nguyengg/tmuxpull/main/bin/rebase-all.py | uv run - ~/Workspaces
+
+# Zsh version — zero dependencies (just git + tmux)
+curl -fsSL https://raw.githubusercontent.com/nguyengg/tmuxpull/main/bin/rebase-all | zsh -s -- ~/Workspaces
+```
+
+### Install with curl (one-liner)
+
+```bash
+# Download the self-contained script to ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/nguyengg/tmuxpull/main/bin/rebase-all.py -o ~/.local/bin/tmuxpull && chmod +x ~/.local/bin/tmuxpull
+tmuxpull ~/Workspaces
+```
+
+The script carries its own dependency metadata (PEP 723), so with `uv` on your PATH it bootstraps its own environment on first run — no venv, no pip install.
+
+### Install from PyPI
+
 ```bash
 # Install via pip/uv (recommended)
 pip install tmuxpull
@@ -12,10 +34,6 @@ tmuxpull ~/Workspaces
 # Or install as a uv tool
 uv tool install tmuxpull
 tmuxpull ~/Workspaces
-
-# Zsh version (fallback) - no dependencies
-chmod +x bin/rebase-all  
-./bin/rebase-all ~/Workspaces
 ```
 
 Both scan for Git repos under the given directories, pull with rebase concurrently, print a summary per repo, and open tmux windows for repos that need your attention (conflicts, failures, etc.).
