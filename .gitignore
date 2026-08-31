@@ -22,3 +22,6 @@ env/
 *.log
 *.tmp
 .cache/
+
+# Local agent/tooling config
+.kiro/
