@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fnmatch
 import os
 import re
 import shutil
@@ -66,6 +67,7 @@ class Result:
     new_sha: str = ""
     log_lines: list[str] = field(default_factory=list)
     shortstat: str = ""
+    skipped: bool = False  # repo opted out via `git config tmuxpull.ignore true`
 
     @property
     def ok(self) -> bool:
@@ -82,6 +84,8 @@ class Result:
         return not self.ok
 
     def summary_line(self) -> str:
+        if self.skipped:
+            return "- ignored (git config tmuxpull.ignore)"
         if not self.ok:
             tail = (self.stderr.strip().splitlines() or [f"exit {self.returncode}"])[-1]
             return f"! FAIL: {tail}"
@@ -133,6 +137,25 @@ def find_repos(roots: Iterable[str], max_depth: int) -> list[Repo]:
     return uniq
 
 
+def apply_excludes(repos: list[Repo], patterns: list[str]) -> tuple[list[Repo], list[Repo]]:
+    """Split repos into (kept, excluded) by fnmatch of display name against patterns.
+
+    Patterns match the repo's display name (e.g. 'kirodotdev/KiroCrew'), so
+    both exact names ('-x kirodotdev/KiroCrew') and globs ('-x "kirodotdev/*"')
+    work.
+    """
+    if not patterns:
+        return repos, []
+    kept: list[Repo] = []
+    excluded: list[Repo] = []
+    for r in repos:
+        if any(fnmatch.fnmatch(r.name, p) for p in patterns):
+            excluded.append(r)
+        else:
+            kept.append(r)
+    return kept, excluded
+
+
 # --------------------------------------------------------------------------- #
 # git                                                                         #
 # --------------------------------------------------------------------------- #
@@ -153,6 +176,13 @@ async def _git(repo: Path, *args: str) -> tuple[int, str, str]:
 
 async def rebase(repo: Repo, sem: asyncio.Semaphore) -> Result:
     async with sem:
+        # Per-repo opt-out: `git config tmuxpull.ignore true` skips the pull
+        # entirely (and no tmux session is created). Unset with
+        # `git config --unset tmuxpull.ignore`.
+        rc_ign, ign_out, _ = await _git(repo.path, "config", "--get", "tmuxpull.ignore")
+        if rc_ign == 0 and ign_out.strip().lower() in ("true", "1", "yes", "on"):
+            return Result(repo=repo, returncode=0, stdout="", stderr="", skipped=True)
+
         rc, out, err = 0, "", ""
         _, old_sha, _ = await _git(repo.path, "rev-parse", "HEAD")
         old_sha = old_sha.strip()
@@ -319,6 +349,18 @@ def main() -> None:
     )
 
     ap.add_argument(
+        "-x",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help=(
+            "Exclude repos whose display name matches this glob (repeatable), "
+            "e.g. -x 'kirodotdev/*'. For a sticky per-repo skip, run "
+            "`git config tmuxpull.ignore true` in the repo instead."
+        ),
+    )
+    ap.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -339,6 +381,9 @@ def main() -> None:
     args = ap.parse_args()
 
     repos = find_repos(args.dirs, args.max_depth)
+    repos, excluded = apply_excludes(repos, args.exclude)
+    for r in excluded:
+        print(f"excluded: {r.name}", file=sys.stderr)
     if not repos:
         print("no git repos found", file=sys.stderr)
         sys.exit(1)
@@ -362,8 +407,10 @@ def main() -> None:
     elif tmux_wanted:
         server = libtmux.Server()
         session_names = []
-        
+
         for r in results:
+            if r.skipped:
+                continue
             session_name = open_repo_session(server, r)
             session_names.append(session_name)
         

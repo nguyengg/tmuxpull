@@ -58,10 +58,27 @@ tmuxpull [-d DEPTH] [-j JOBS] [--tmux {all,attn,off}]
 
 - `-d, --max-depth N` — Directory search depth (default: 2)
 - `-j, --jobs N` — Max concurrent rebases (default: min(8, 2×CPU))
+- `-x, --exclude GLOB` — Skip repos whose name matches the glob (repeatable), e.g. `-x 'kirodotdev/*'`
 - `--tmux {all,attn,off}` — tmux windows for: all repos, attention-only (default), or none
 - `-s, --session NAME` — tmux session name (default: "rebase") 
 - `-v, --verbose` — Show commit subjects (-v = top 3, -vv = all)
 - `--dry-run` — List repos that would be processed, then exit
+
+### Ignoring a repo
+
+Two ways to skip a repo:
+
+```bash
+# Sticky, per-repo (survives every run until unset) — e.g. a repo whose tip is broken:
+git -C ~/github.com/kirodotdev/KiroCrew config tmuxpull.ignore true
+# undo:
+git -C ~/github.com/kirodotdev/KiroCrew config --unset tmuxpull.ignore
+
+# One-off, per-run:
+tmuxpull -x 'kirodotdev/*' ~/github.com
+```
+
+Ignored repos print `- ignored` in the summary and get no tmux session.
 
 ### Examples
 
