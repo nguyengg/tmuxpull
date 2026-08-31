@@ -59,8 +59,7 @@ tmuxpull [-d DEPTH] [-j JOBS] [--tmux {all,attn,off}]
 - `-d, --max-depth N` — Directory search depth (default: 2)
 - `-j, --jobs N` — Max concurrent rebases (default: min(8, 2×CPU))
 - `-x, --exclude GLOB` — Skip repos whose name matches the glob (repeatable), e.g. `-x 'kirodotdev/*'`
-- `--tmux {all,attn,off}` — tmux windows for: all repos, attention-only (default), or none
-- `-s, --session NAME` — tmux session name (default: "rebase") 
+- `--tmux {on,off}` — Create per-repo tmux sessions (default: on)
 - `-v, --verbose` — Show commit subjects (-v = top 3, -vv = all)
 - `--dry-run` — List repos that would be processed, then exit
 
