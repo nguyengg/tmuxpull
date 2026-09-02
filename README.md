@@ -104,7 +104,7 @@ other-repo        · up to date
 broken-thing      ✗ FAIL: could not apply autostash
 ```
 
-Failed repos open tmux windows in the "rebase" session (or `-s NAME`), landing on `git status` so you see what's broken. Attach with `tmux attach -t rebase`.
+After the rebase finishes, if you're on a TTY you get an **interactive session picker**: use ↑/↓ (or `j`/`k`), Enter to `tmux attach` straight into the chosen session, `q`/Esc to skip. Failed repos are listed first and highlighted red so they're the natural first pick. Inside an existing tmux client this becomes `tmux switch-client` (nested `attach` is refused). When output is piped or redirected the picker is skipped and the full `tmux attach -t <name>` list is printed instead, so scripts and CI still work.
 
 ## Two Versions
 

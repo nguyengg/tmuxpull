@@ -242,46 +242,114 @@ def _make_session_name(repo: Repo) -> str:
 
 def open_repo_session(server: libtmux.Server, r: Result) -> str:
     """Create or update a tmux session for a specific repo.
-    
-    Returns the session name for user reference.
+
+    Returns the session name for user reference. The window name is left as
+    tmux's default (typically the running command) — the session name already
+    identifies the repo, so a hard-coded "rebase" window name adds nothing.
     """
     session_name = _make_session_name(r.repo)
-    window_name = "rebase"
-    
+
     # Try to get existing session
     sess = server.sessions.get(session_name=session_name, default=None)
-    
+
     if sess is None:
-        # Create new session with rebase as the first window
         sess = server.new_session(
             session_name=session_name,
-            window_name=window_name,
             start_directory=str(r.repo.path),
             attach=False,
         )
         pane = sess.active_pane
     else:
-        # Session exists, add a new rebase window
-        # Check if rebase window already exists
-        existing_rebase = None
-        for window in sess.windows:
-            if window.name == window_name:
-                existing_rebase = window
-                break
-        
-        if existing_rebase:
-            # Rebase window exists, make it unique with timestamp
-            import time
-            window_name = f"rebase-{int(time.time()) % 10000}"
-        
+        # Session already exists (re-run) — add a new window so nothing is lost.
         pane = sess.new_window(
-            window_name=window_name,
             start_directory=str(r.repo.path),
         ).active_pane
-    
+
     # Always land on git status to show current state
     pane.send_keys("git status")
     return session_name
+
+
+# --------------------------------------------------------------------------- #
+# interactive picker                                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _pick_session(names: list[str], failed: set[str]) -> str | None:
+    """Interactive TTY picker for the tmux sessions just created.
+
+    Uses stdlib curses. Failed repos are listed first and highlighted red so
+    they're the natural first pick. Returns the chosen session name, or
+    None if the user skipped (Esc/q) or the terminal isn't interactive.
+
+    Keys: Up/Down or j/k to move, PgUp/PgDn to page, g/G for top/bottom,
+    Enter to attach, q or Esc to skip.
+    """
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+    import curses
+
+    ordered = sorted(set(names), key=lambda n: (n not in failed, n))
+    if not ordered:
+        return None
+
+    def _loop(stdscr: curses.window) -> str | None:
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        try:
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_RED, -1)
+        except curses.error:
+            pass
+        idx = 0
+        top = 0
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            attn = f", {len(failed)} need attention" if failed else ""
+            hdr = (
+                f"tmuxpull: {len(ordered)} session(s){attn}. "
+                "Up/Down (j/k) to move, Enter to attach, q/Esc to skip."
+            )
+            stdscr.addnstr(0, 0, hdr, max(1, w - 1), curses.A_BOLD)
+            body_h = max(1, h - 2)
+            if idx < top:
+                top = idx
+            elif idx >= top + body_h:
+                top = idx - body_h + 1
+            for row, i in enumerate(range(top, min(top + body_h, len(ordered)))):
+                name = ordered[i]
+                marker = "! " if name in failed else "  "
+                text = f"{marker}{name}"
+                attr = curses.A_REVERSE if i == idx else 0
+                if name in failed:
+                    attr |= curses.color_pair(1)
+                stdscr.addnstr(row + 1, 0, text, max(1, w - 1), attr)
+            stdscr.refresh()
+            k = stdscr.getch()
+            if k in (curses.KEY_UP, ord("k")):
+                idx = (idx - 1) % len(ordered)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                idx = (idx + 1) % len(ordered)
+            elif k == curses.KEY_HOME or k == ord("g"):
+                idx = 0
+            elif k == curses.KEY_END or k == ord("G"):
+                idx = len(ordered) - 1
+            elif k == curses.KEY_NPAGE:
+                idx = min(len(ordered) - 1, idx + body_h)
+            elif k == curses.KEY_PPAGE:
+                idx = max(0, idx - body_h)
+            elif k in (curses.KEY_ENTER, 10, 13):
+                return ordered[idx]
+            elif k in (27, ord("q")):  # Esc or q
+                return None
+            elif k == curses.KEY_RESIZE:
+                continue
+
+    try:
+        return curses.wrapper(_loop)
+    except (KeyboardInterrupt, curses.error):
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -406,17 +474,34 @@ def main() -> None:
         print("tmux not on PATH; skipping sessions", file=sys.stderr)
     elif tmux_wanted:
         server = libtmux.Server()
-        session_names = []
+        session_names: list[str] = []
+        failure_names: set[str] = set()
 
         for r in results:
             if r.skipped:
                 continue
             session_name = open_repo_session(server, r)
             session_names.append(session_name)
-        
+            if not r.ok:
+                failure_names.add(session_name)
+
         if session_names:
-            print(f"\n{len(session_names)} tmux session(s) created:", file=sys.stderr)
-            for name in sorted(set(session_names)):
-                print(f"  tmux attach -t {name}", file=sys.stderr)
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                picked = _pick_session(session_names, failure_names)
+                if picked:
+                    # Replace this process with tmux so the user drops straight
+                    # into the chosen session (and tmux owns the exit code).
+                    # Inside an existing tmux client we must `switch-client`
+                    # instead of `attach` (nested attach is refused).
+                    if os.environ.get("TMUX"):
+                        os.execvp("tmux", ["tmux", "switch-client", "-t", picked])
+                    else:
+                        os.execvp("tmux", ["tmux", "attach", "-t", picked])
+                # user hit q/Esc: fall through to normal exit
+            else:
+                # Non-interactive (piped/redirected): print the full list.
+                print(f"\n{len(session_names)} tmux session(s) created:", file=sys.stderr)
+                for name in sorted(set(session_names)):
+                    print(f"  tmux attach -t {name}", file=sys.stderr)
 
     sys.exit(1 if fails else 0)
