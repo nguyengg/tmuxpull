@@ -124,12 +124,17 @@ a test fails if the two drift, so they always ship identical behavior.
 ### `bin/rebase-all` (Fallback)
 
 - **Pure Zsh** — no Python dependencies
-- Basic summaries (commit count only, no diffstat)
-- Simpler concurrency model with job control
+- Same per-repo tmux sessions, same TTY session picker (arrow keys, failures
+  first, Enter attach / switch-client, q or Esc skip, piped-mode list print)
+- Same options: `-j`, `-d`, `-x`, `--tmux on/off`, `-v`/`-vv`, `--dry-run`,
+  plus the `git config tmuxpull.ignore` per-repo opt-out
+- Same summary shape: `+ N commits  <shortstat>`, `= up to date`, `! FAIL:`
 
-> **Note on drift**: the Zsh script is a deliberately simpler port and is NOT
-> kept feature-identical with the Python version. Expect it to lag behind —
-> it exists for machines where installing Python/uv isn't worth it.
+> **Note on drift**: the Zsh port has been re-aligned to the Python version and
+> now matches its feature set. The one deliberate difference: summaries print
+> in input order at the end of the run (vs. Python's live completion-order
+> `[n/N]` counter). If the two ever drift again, the Python version wins as
+> source of truth.
 
 **Requirements**: Zsh, tmux, git
 

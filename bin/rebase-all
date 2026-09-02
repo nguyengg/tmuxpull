@@ -1,35 +1,52 @@
 #!/bin/zsh
-# rebase-all -- concurrent git pull --rebase --autostash with tmux attention windows
+# rebase-all -- Zsh port of tmuxpull.
 #
-# Zsh fallback for machines without Python/uv. For the full-featured version,
-# use rebase-all.py (PEP 723 single-file with libtmux, git log summaries, etc.).
+# Concurrent `git pull --rebase --autostash` across every Git repo under the
+# given roots. Prints a per-repo summary of what changed, creates a dedicated
+# tmux SESSION per repo landing on `git status`, and (on a TTY) drops you into
+# an interactive picker so you can Enter-attach the one you want to look at.
 #
-# Usage: rebase-all [-j JOBS] [-d DEPTH] [-s SESSION] [--dry-run] DIR [DIR...]
+# For richer summaries and identical output formatting, prefer the Python
+# version (bin/rebase-all.py, needs uv). Both scripts now share the same
+# per-repo-session tmux model and TTY picker UX.
+#
+# Usage:
+#   rebase-all [-j JOBS] [-d DEPTH] [-x GLOB] [--tmux on|off] [-v] [--dry-run] DIR [DIR...]
 
-set -euo pipefail
+set -uo pipefail
 
-# defaults
+# --- defaults ------------------------------------------------------------
 max_depth=2
 jobs=8
-session="rebase"
+typeset -a excludes
+excludes=()
+tmux_mode="on"
 dry_run=false
-tmux_mode="attn"  # all | attn | off
+verbose=0
 
 usage() {
     cat >&2 <<'EOF'
-Usage: rebase-all [-j JOBS] [-d DEPTH] [-s SESSION] [--dry-run] DIR [DIR...]
+Usage: rebase-all [OPTIONS] DIR [DIR...]
+
+Concurrently `git pull --rebase --autostash` every git repo under the given
+roots. Print a per-repo summary, then create one tmux SESSION per repo
+landing on `git status`. On a TTY you get an interactive picker (arrow keys
+/ j-k to move, Enter to attach, q/Esc to skip); when output is piped, the
+list of `tmux attach` commands is printed instead.
 
 Options:
-  -j JOBS      Max concurrent rebases (default: 8)
-  -d DEPTH     Directory search depth (default: 2)  
-  -s SESSION   tmux session name (default: rebase)
-  --tmux MODE  Open tmux windows for: all repos, attn (default), or off
-  --dry-run    List repos and exit
-  -h, --help   Show this help
+  -j JOBS       Max concurrent rebases (default: 8)
+  -d DEPTH      Directory search depth (default: 2)
+  -x GLOB       Exclude repos whose display name matches this glob
+                (repeatable), e.g. -x 'kirodotdev/*'
+  --tmux MODE   on (default) or off
+  -v            Verbose: -v shows top 3 commit subjects per changed repo,
+                -vv shows all
+  --dry-run     List repos and exit
+  -h, --help    Show this help
 
-Examples:
-  rebase-all ~/Workspaces
-  rebase-all -j 4 --tmux all ~/Projects ~/Work
+Per-repo sticky opt-out:
+  git -C /path/to/repo config tmuxpull.ignore true
 EOF
 }
 
@@ -37,10 +54,13 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -j) jobs=$2; shift 2 ;;
         -d) max_depth=$2; shift 2 ;;
-        -s) session=$2; shift 2 ;;
+        -x) excludes+=("$2"); shift 2 ;;
         --tmux) tmux_mode=$2; shift 2 ;;
+        -v) ((verbose++)); shift ;;
+        -vv) verbose=2; shift ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
         -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
         *) break ;;
     esac
@@ -52,147 +72,364 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
-# find repos
-repos=()
+# --- repo discovery ------------------------------------------------------
+typeset -a repo_paths repo_names
+repo_paths=(); repo_names=()
+
 for root in "$@"; do
     if [[ ! -d "$root" ]]; then
         echo "skip: $root is not a directory" >&2
         continue
     fi
-    
-    # find .git dirs, respecting max_depth and skipping noise dirs
+    top=${root:A}
     while IFS= read -r -d '' gitdir; do
-        repo="${gitdir%/.git}"
-        repos+=("$repo")
-    done < <(find "$root" -mindepth 1 -maxdepth $((max_depth + 1)) \
-                -name ".git" -type d \
+        repo=${gitdir%/.git}
+        if [[ "$repo" == "$top" ]]; then
+            name="."
+        else
+            name=${repo#$top/}
+        fi
+        repo_paths+=("$repo")
+        repo_names+=("$name")
+    done < <(find "$top" -mindepth 1 -maxdepth $((max_depth + 1)) \
+                -name ".git" \( -type d -o -type f \) \
                 -not -path "*/node_modules/*" \
                 -not -path "*/.venv/*" \
                 -not -path "*/venv/*" \
+                -not -path "*/env/*" \
                 -not -path "*/target/*" \
                 -not -path "*/build/*" \
                 -not -path "*/dist/*" \
                 -not -path "*/__pycache__/*" \
+                -not -path "*/.mypy_cache/*" \
+                -not -path "*/.pytest_cache/*" \
+                -not -path "*/.ruff_cache/*" \
+                -not -path "*/.tox/*" \
                 -print0 2>/dev/null)
 done
 
-if [[ ${#repos[@]} -eq 0 ]]; then
+# dedupe overlapping roots
+typeset -A seen
+typeset -a uniq_paths uniq_names
+uniq_paths=(); uniq_names=()
+for i in {1..${#repo_paths[@]}}; do
+    p="${repo_paths[i]}"
+    [[ -n "${seen[$p]-}" ]] && continue
+    seen[$p]=1
+    uniq_paths+=("$p")
+    uniq_names+=("${repo_names[i]}")
+done
+repo_paths=("${uniq_paths[@]}")
+repo_names=("${uniq_names[@]}")
+
+# apply -x excludes (fnmatch via zsh globs)
+if (( ${#excludes[@]} > 0 )); then
+    typeset -a kept_paths kept_names
+    kept_paths=(); kept_names=()
+    for i in {1..${#repo_paths[@]}}; do
+        name="${repo_names[i]}"
+        excluded=false
+        for pat in "${excludes[@]}"; do
+            if [[ "$name" == ${~pat} ]]; then
+                excluded=true
+                echo "excluded: $name" >&2
+                break
+            fi
+        done
+        if [[ "$excluded" == false ]]; then
+            kept_paths+=("${repo_paths[i]}")
+            kept_names+=("$name")
+        fi
+    done
+    repo_paths=("${kept_paths[@]}")
+    repo_names=("${kept_names[@]}")
+fi
+
+if [[ ${#repo_paths[@]} -eq 0 ]]; then
     echo "no git repos found" >&2
     exit 1
 fi
 
 if [[ "$dry_run" == "true" ]]; then
-    printf '%s\n' "${repos[@]}"
+    printf '%s\n' "${repo_paths[@]}"
     exit 0
 fi
 
-echo "rebasing ${#repos[@]} repo(s) (jobs=$jobs)..." >&2
+total=${#repo_paths[@]}
+echo "rebasing $total repo(s) (jobs=$jobs)..." >&2
 
-# set up temp dir for per-repo status files
+# --- concurrent rebase ---------------------------------------------------
 tmpdir=$(mktemp -d)
 trap "rm -rf $tmpdir" EXIT
 
-# concurrent rebase function
-rebase_one() {
-    local repo=$1
-    local slug=${repo//\//_}  # sanitize path for filename
-    local old_sha new_sha
-    
-    cd "$repo"
-    old_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
-    
-    if git pull --rebase --autostash >"$tmpdir/$slug.out" 2>"$tmpdir/$slug.err"; then
-        echo "0" > "$tmpdir/$slug.status"
-        new_sha=$(git rev-parse HEAD 2>/dev/null || echo "$old_sha")
-        
-        # simple change detection
-        if [[ -n "$old_sha" && "$old_sha" != "$new_sha" ]]; then
-            local count=$(git rev-list --count "$old_sha..$new_sha" 2>/dev/null || echo "0")
-            echo "✓ $count commit(s)" > "$tmpdir/$slug.summary"
-        else
-            echo "· up to date" > "$tmpdir/$slug.summary"
-        fi
-    else
-        local rc=$?
-        echo "$rc" > "$tmpdir/$slug.status"
-        local err_tail=$(tail -n1 "$tmpdir/$slug.err" 2>/dev/null || echo "exit $rc")
-        echo "✗ FAIL: $err_tail" > "$tmpdir/$slug.summary"
-    fi
-}
-
-# fan out work with job control
-pids=()
-for repo in "${repos[@]}"; do
-    rebase_one "$repo" &
-    pids+=($!)
-    
-    # wait for a slot if we're at the job limit
-    if (( ${#pids[@]} >= jobs )); then
-        wait -n  # wait for next job to complete (zsh 5.9+, bash 4.3+)
-        # rebuild pids array without completed jobs
-        local new_pids=()
-        for pid in "${pids[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                new_pids+=("$pid")
-            fi
-        done
-        pids=("${new_pids[@]}")
-    fi
-done
-
-# wait for remaining jobs
-wait
-
-# collect results and print report
-fails=0
-needs_attention=()
-
-# find max repo name length for alignment
 max_width=0
-for repo in "${repos[@]}"; do
-    local name=${repo##*/}  # basename
+for name in "${repo_names[@]}"; do
     (( ${#name} > max_width )) && max_width=${#name}
 done
 
-for repo in "${repos[@]}"; do
+rebase_one() {
+    local i=$1
+    local repo="${repo_paths[i]}"
+    local name="${repo_names[i]}"
     local slug=${repo//\//_}
-    local name=${repo##*/}
-    local status=$(cat "$tmpdir/$slug.status" 2>/dev/null || echo "999")
-    local summary=$(cat "$tmpdir/$slug.summary" 2>/dev/null || echo "unknown")
-    
-    printf "%-${max_width}s  %s\n" "$name" "$summary"
-    
-    if [[ "$status" != "0" ]]; then
+    local old_sha new_sha rc
+
+    # per-repo sticky opt-out
+    local ign
+    ign=$(git -C "$repo" config --get tmuxpull.ignore 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if [[ "$ign" == "true" || "$ign" == "1" || "$ign" == "yes" || "$ign" == "on" ]]; then
+        echo "SKIPPED" > "$tmpdir/$slug.status"
+        echo "- ignored (git config tmuxpull.ignore)" > "$tmpdir/$slug.summary"
+        return
+    fi
+
+    old_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "")
+    if git -C "$repo" pull --rebase --autostash >"$tmpdir/$slug.out" 2>"$tmpdir/$slug.err"; then
+        rc=0
+        new_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "$old_sha")
+        echo "$rc" > "$tmpdir/$slug.status"
+        if [[ -n "$old_sha" && "$old_sha" != "$new_sha" ]]; then
+            local count shortstat plural
+            count=$(git -C "$repo" rev-list --count "$old_sha..$new_sha" 2>/dev/null || echo "0")
+            shortstat=$(git -C "$repo" diff --shortstat "$old_sha..$new_sha" 2>/dev/null | sed 's/^ *//')
+            plural=$([[ "$count" == "1" ]] && echo "" || echo "s")
+            if [[ -n "$shortstat" ]]; then
+                echo "+ $count commit$plural  $shortstat" > "$tmpdir/$slug.summary"
+            else
+                echo "+ $count commit$plural" > "$tmpdir/$slug.summary"
+            fi
+            git -C "$repo" log --oneline --no-decorate "$old_sha..$new_sha" > "$tmpdir/$slug.log" 2>/dev/null
+        else
+            echo "= up to date" > "$tmpdir/$slug.summary"
+        fi
+    else
+        rc=$?
+        echo "$rc" > "$tmpdir/$slug.status"
+        local err_tail
+        err_tail=$(tail -n1 "$tmpdir/$slug.err" 2>/dev/null || echo "exit $rc")
+        [[ -z "$err_tail" ]] && err_tail="exit $rc"
+        echo "! FAIL: $err_tail" > "$tmpdir/$slug.summary"
+    fi
+}
+
+# fan out, up to $jobs concurrent
+typeset -a pids
+pids=()
+for i in {1..$total}; do
+    rebase_one $i &
+    pids+=($!)
+    if (( ${#pids[@]} >= jobs )); then
+        wait -n 2>/dev/null || true
+        typeset -a live_pids
+        live_pids=()
+        for pid in "${pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null && live_pids+=("$pid")
+        done
+        pids=("${live_pids[@]}")
+    fi
+done
+wait
+
+# --- print results in input order ---------------------------------------
+fails=0
+for i in {1..$total}; do
+    repo="${repo_paths[i]}"
+    name="${repo_names[i]}"
+    slug=${repo//\//_}
+    st=$(cat "$tmpdir/$slug.status" 2>/dev/null || echo "999")
+    summary=$(cat "$tmpdir/$slug.summary" 2>/dev/null || echo "unknown")
+
+    if [[ "$st" == "0" || "$st" == "SKIPPED" ]]; then
+        printf "[%d/%d] %-${max_width}s  %s\n" "$i" "$total" "$name" "$summary"
+    else
+        printf "[%d/%d] %-${max_width}s  %s\n" "$i" "$total" "$name" "$summary" >&2
         (( fails++ ))
-        needs_attention+=("$repo")
+    fi
+
+    if (( verbose > 0 )) && [[ -f "$tmpdir/$slug.log" ]]; then
+        if (( verbose > 1 )); then cap=999999; else cap=3; fi
+        shown=0
+        while IFS= read -r line; do
+            (( shown < cap )) || break
+            printf "        %s\n" "$line"
+            (( shown++ ))
+        done < "$tmpdir/$slug.log"
+        total_lines=$(wc -l < "$tmpdir/$slug.log")
+        if (( verbose <= 1 )) && (( total_lines > 3 )); then
+            printf "        ... +%d more\n" $((total_lines - 3))
+        fi
     fi
 done
 
-# open tmux windows for repos needing attention
-if [[ "$tmux_mode" != "off" ]] && command -v tmux >/dev/null; then
-    opened=0
-    target_repos=()
-    
-    case "$tmux_mode" in
-        all) target_repos=("${repos[@]}") ;;
-        attn) target_repos=("${needs_attention[@]}") ;;
-    esac
-    
-    for repo in "${target_repos[@]}"; do
-        local win_name=${repo##*/}  # basename
-        local clean_name=${win_name//[: .]/_}  # sanitize for tmux
-        
-        if tmux has-session -t "$session" 2>/dev/null; then
-            tmux new-window -t "$session:" -n "$clean_name" -c "$repo" \; send-keys 'git status' Enter
-        else
-            tmux new-session -d -s "$session" -n "$clean_name" -c "$repo" \; send-keys 'git status' Enter
-        fi
-        (( opened++ ))
+# --- tmux --------------------------------------------------------------
+if [[ "$tmux_mode" != "on" ]]; then
+    exit $((fails > 0 ? 1 : 0))
+fi
+
+if ! command -v tmux >/dev/null; then
+    echo "tmux not on PATH; skipping sessions" >&2
+    exit $((fails > 0 ? 1 : 0))
+fi
+
+# Session name = "<parent>/<repo>" with ':', '.', space, tab -> '_'. tmux allows '/'.
+make_session_name() {
+    local repo="$1"
+    local parent name
+    parent=${repo:h}
+    parent=${parent:t}
+    name=${repo:t}
+    local sname
+    if [[ -z "$parent" || "$parent" == "/" ]]; then
+        sname="$name"
+    else
+        sname="$parent/$name"
+    fi
+    sname="${sname//[:. 	]/_}"
+    [[ -z "$sname" ]] && sname="rebase"
+    printf '%s' "$sname"
+}
+
+typeset -a session_names
+typeset -A session_failed
+session_names=()
+for i in {1..$total}; do
+    repo="${repo_paths[i]}"
+    slug=${repo//\//_}
+    st=$(cat "$tmpdir/$slug.status" 2>/dev/null || echo "999")
+    [[ "$st" == "SKIPPED" ]] && continue
+
+    sname=$(make_session_name "$repo")
+    if tmux has-session -t "=$sname" 2>/dev/null; then
+        tmux new-window -t "=$sname:" -c "$repo" \; send-keys -t "=$sname:" 'git status' Enter >/dev/null 2>&1
+    else
+        tmux new-session -d -s "$sname" -c "$repo" \; send-keys -t "=$sname:" 'git status' Enter >/dev/null 2>&1
+    fi
+    session_names+=("$sname")
+    [[ "$st" != "0" ]] && session_failed[$sname]=1
+done
+
+if (( ${#session_names[@]} == 0 )); then
+    exit $((fails > 0 ? 1 : 0))
+fi
+
+# --- interactive picker (TTY-only) --------------------------------------
+if [[ ! -t 0 || ! -t 1 ]]; then
+    echo >&2
+    echo "${#session_names[@]} tmux session(s) created:" >&2
+    for n in ${(o)session_names}; do
+        echo "  tmux attach -t $n" >&2
     done
-    
-    if (( opened > 0 )); then
-        echo >&2
-        echo "$opened tmux window(s) in session '$session'.  attach: tmux attach -t $session" >&2
+    exit $((fails > 0 ? 1 : 0))
+fi
+
+# Ordered list: failures first (alpha), then clean (alpha).
+typeset -a fail_sorted ok_sorted ordered
+fail_sorted=(); ok_sorted=()
+for n in ${(o)session_names}; do
+    if [[ -n "${session_failed[$n]-}" ]]; then
+        fail_sorted+=("$n")
+    else
+        ok_sorted+=("$n")
+    fi
+done
+ordered=("${fail_sorted[@]}" "${ok_sorted[@]}")
+n_ordered=${#ordered[@]}
+n_fail=${#fail_sorted[@]}
+
+stty_orig=$(stty -g)
+term_cleaned=0
+cleanup_term() {
+    (( term_cleaned )) && return
+    term_cleaned=1
+    stty "$stty_orig" 2>/dev/null
+    printf '\e[?25h\e[0m'  # show cursor, reset attributes
+}
+trap 'cleanup_term' EXIT INT TERM
+stty -icanon -echo min 1 time 0
+printf '\e[?25l'  # hide cursor
+
+idx=1
+top=1
+render() {
+    local rows cols
+    local size
+    size=$(stty size 2>/dev/null || echo '24 80')
+    rows=${size% *}
+    cols=${size#* }
+    local body_h=$((rows - 2))
+    (( body_h < 1 )) && body_h=1
+    (( idx < top )) && top=$idx
+    (( idx >= top + body_h )) && top=$((idx - body_h + 1))
+    (( top < 1 )) && top=1
+
+    printf '\e[H\e[2J'
+    local hdr="tmuxpull: $n_ordered session(s)"
+    (( n_fail > 0 )) && hdr="$hdr, $n_fail need attention"
+    hdr="$hdr. Up/Down (j/k) to move, Enter to attach, q/Esc to skip."
+    printf '\e[1m%s\e[0m\n' "${hdr:0:cols}"
+    local end=$((top + body_h - 1))
+    (( end > n_ordered )) && end=$n_ordered
+    for j in {$top..$end}; do
+        local n="${ordered[j]}"
+        local marker="  "
+        local color=""
+        if [[ -n "${session_failed[$n]-}" ]]; then
+            marker="! "
+            color=$'\e[31m'
+        fi
+        local reverse=""
+        (( j == idx )) && reverse=$'\e[7m'
+        local line="${marker}${n}"
+        printf '%s%s%s\e[0m\n' "$color" "$reverse" "${line:0:cols}"
+    done
+}
+
+picked=""
+pick_action="skip"
+while true; do
+    render
+    local key rest2
+    if ! IFS= read -r -k1 key 2>/dev/null; then
+        pick_action="skip"; break
+    fi
+    case "$key" in
+        $'\e')
+            # ESC alone, or the start of an arrow sequence
+            if IFS= read -r -k1 -t 0.05 rest2 2>/dev/null; then
+                if [[ "$rest2" == '[' ]]; then
+                    local arrow
+                    IFS= read -r -k1 arrow 2>/dev/null || arrow=""
+                    case "$arrow" in
+                        A) (( idx-- )); (( idx < 1 )) && idx=$n_ordered ;;
+                        B) (( idx++ )); (( idx > n_ordered )) && idx=1 ;;
+                        H) idx=1 ;;
+                        F) idx=$n_ordered ;;
+                    esac
+                fi
+            else
+                pick_action="skip"; break
+            fi
+            ;;
+        $'\n'|$'\r'|"")
+            # zsh under -k1 in raw mode returns Enter as '' or $'\r' depending on config
+            pick_action="pick"; picked="${ordered[idx]}"; break
+            ;;
+        q|Q) pick_action="skip"; break ;;
+        j) (( idx++ )); (( idx > n_ordered )) && idx=1 ;;
+        k) (( idx-- )); (( idx < 1 )) && idx=$n_ordered ;;
+        g) idx=1 ;;
+        G) idx=$n_ordered ;;
+    esac
+done
+
+cleanup_term
+trap - INT TERM  # keep EXIT (tmpdir cleanup) but drop int/term handlers
+
+if [[ "$pick_action" == "pick" && -n "$picked" ]]; then
+    if [[ -n "${TMUX-}" ]]; then
+        exec tmux switch-client -t "=$picked"
+    else
+        exec tmux attach -t "=$picked"
     fi
 fi
 
