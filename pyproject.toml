@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tmuxpull"
-version = "0.1.2"
-description = "Concurrent git pull --rebase --autostash across multiple repos with tmux attention windows"
+version = "0.2.0"
+description = "Keep every git repo under a directory in step with its remote, concurrently, with a tmux session per repo that needs you"
 readme = "README.md"
 license = "MIT"
 authors = [
