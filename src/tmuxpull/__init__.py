@@ -53,7 +53,7 @@ import libtmux
 # Single source of truth for the version: pyproject.toml reads it from here
 # (hatch dynamic version), so the PyPI package, the generated standalone script
 # and `--version` can never disagree.
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 # Directories that are never a repo we want to descend into.

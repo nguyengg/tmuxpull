@@ -100,7 +100,7 @@ tmuxpull [-d DEPTH] [-j JOBS] [--tmux {on,off}] [--rebase-pushed]
 
 ```bash
 $ tmuxpull --version
-tmuxpull 0.2.0 (/home/you/.local/share/uv/tools/tmuxpull/lib/python3.14/site-packages/tmuxpull/__init__.py)
+tmuxpull 0.2.1 (/home/you/.local/share/uv/tools/tmuxpull/lib/python3.14/site-packages/tmuxpull/__init__.py)
 ```
 
 The path is there because one machine can easily have three copies on `PATH` —

@@ -36,7 +36,7 @@ set -uo pipefail
 
 # --- defaults ------------------------------------------------------------
 # Kept in step with src/tmuxpull/__init__.py's __version__ by a test.
-version="0.2.0"
+version="0.2.1"
 max_depth=2
 jobs=8
 typeset -a excludes
