@@ -2,8 +2,12 @@
 python = "3.12"
 uv = "latest"
 
-[env]
-PYTHONPATH = "src"
+# No [env] PYTHONPATH here on purpose. `uv sync` installs the project editable
+# into .venv, so `uv run tmuxpull` and `uv run pytest` already import from src/.
+# Exporting PYTHONPATH=src additionally made every python process started in
+# this directory prefer the working tree -- including a globally installed
+# tmuxpull, which then silently ran whatever was checked out here instead of the
+# released code.
 
 [tasks.install]
 description = "Install dependencies for development"
