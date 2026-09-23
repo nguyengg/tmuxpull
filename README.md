@@ -1,6 +1,8 @@
 # tmuxpull
 
-Concurrent `git pull --rebase --autostash` across multiple Git repositories with tmux integration.
+Keep every Git repo under a directory in step with its remote, concurrently, so
+merge conflicts surface **this morning** instead of at push time — with a tmux
+session per repo for the ones that need you.
 
 ## Quick Start
 
@@ -36,48 +38,77 @@ uv tool install tmuxpull
 tmuxpull ~/Workspaces
 ```
 
-Both scan for Git repos under the given directories, pull with rebase concurrently, print a summary per repo, and open tmux windows for repos that need your attention (conflicts, failures, etc.).
+## What it does to each repo
 
-## Features
+The **default branch** (`main`, or whatever `origin/HEAD` points at) is the
+reference point — never whatever happens to be checked out. Every repo gets a
+`git fetch --prune` first, then:
 
-- **Concurrent execution** with configurable job limits
-- **Smart repo discovery** with depth limits and noise filtering (skips `node_modules`, `.venv`, etc.)
-- **Per-repo summaries** showing commits pulled and file change stats (Python version)
-- **tmux integration** — opens windows for repos needing attention, landing on `git status`
-- **Multiple modes**: attention-only (default), all repos, or no tmux
-- **PEP 723 packaging** (Python) — zero-setup single file with dependencies declared inline
+| you are on | what happens | your worktree |
+|---|---|---|
+| the default branch | `git pull --rebase --autostash` — your unpushed commits replay onto the new upstream | rebased in place |
+| a branch you never pushed | `git rebase --autostash <remote>/<default>` — nothing is published yet, so replaying is free | rebased in place |
+| a branch you **have** pushed | detect only: the branch fast-forwards to its own upstream, and `git merge-tree` probes it against the new default branch | untouched |
+| detached HEAD | detect only | untouched |
+
+Two things happen regardless: the local default branch is **fast-forwarded by a
+plain ref update, with no checkout**, so the next branch you cut is current; and
+if another worktree has it checked out, it's left alone for that worktree's own
+run.
+
+### Why pushed branches are only probed
+
+Rebasing commits that already exist on the remote means your next push needs
+`--force-with-lease` — not something a batch tool should decide for you across a
+dozen repos. `git merge-tree` answers "would this conflict?" entirely in memory:
+no checkout, no index, nothing to clean up. It models a *merge*, so a clean
+answer is a strong signal rather than a guarantee that replaying every commit is
+clean.
+
+Pass `--rebase-pushed` to rebase them for real. It refuses for any branch whose
+upstream has commits you don't have — replaying only your side would orphan the
+pushed ones.
+
+### Conflicts are left in progress
+
+A rebase that stops is **not** aborted. The repo keeps its conflict markers and
+its in-progress rebase, and its tmux session is where you resolve it. That's the
+point of the tool: clean repos print a line and disappear, broken ones become
+your work queue.
 
 ## Usage
 
 ```bash
-tmuxpull [-d DEPTH] [-j JOBS] [--tmux {all,attn,off}] 
-         [-s SESSION] [-v] [--dry-run] DIR [DIR ...]
+tmuxpull [-d DEPTH] [-j JOBS] [--tmux {on,off}] [--rebase-pushed]
+         [--log PATH] [--no-log] [-v] [--dry-run] DIR [DIR ...]
 ```
 
 ### Options
 
 - `-d, --max-depth N` — Directory search depth (default: 2)
-- `-j, --jobs N` — Max concurrent rebases (default: min(8, 2×CPU))
+- `-j, --jobs N` — Max concurrent repos (default: min(8, 2×CPU))
 - `-x, --exclude GLOB` — Skip repos whose name matches the glob (repeatable), e.g. `-x 'kirodotdev/*'`
 - `--tmux {on,off}` — Create per-repo tmux sessions (default: on)
-- `-v, --verbose` — Show commit subjects (-v = top 3, -vv = all)
+- `--rebase-pushed` — Also rebase pushed branches (costs you a `--force-with-lease`)
+- `--log PATH` — Write the run report here (default: `$XDG_STATE_HOME/tmuxpull/last-run.log`)
+- `--no-log` — Don't write a report file
+- `-v, --verbose` — Show incoming commit subjects (`-v` = top 3, `-vv` = all)
 - `--dry-run` — List repos that would be processed, then exit
 
-### Ignoring a repo
-
-Two ways to skip a repo:
+### Per-repo git config
 
 ```bash
-# Sticky, per-repo (survives every run until unset) — e.g. a repo whose tip is broken:
+# Skip a repo entirely (survives every run until unset) — e.g. a broken tip:
 git -C ~/github.com/kirodotdev/KiroCrew config tmuxpull.ignore true
-# undo:
 git -C ~/github.com/kirodotdev/KiroCrew config --unset tmuxpull.ignore
 
-# One-off, per-run:
-tmuxpull -x 'kirodotdev/*' ~/github.com
+# Override the detected default branch:
+git -C ~/github.com/acme/legacy config tmuxpull.defaultBranch release
 ```
 
-Ignored repos print `- ignored` in the summary and get no tmux session.
+Default-branch detection order: `tmuxpull.defaultBranch`, then
+`refs/remotes/<remote>/HEAD`, then a probe of `main` / `master` / `trunk`.
+The remote is `origin` when present, otherwise the first one configured.
 
 ### Examples
 
@@ -85,26 +116,71 @@ Ignored repos print `- ignored` in the summary and get no tmux session.
 # Morning sync across your workspace
 tmuxpull ~/Workspaces ~/Projects
 
-# High concurrency, all repos get tmux windows
-tmuxpull -j 16 --tmux all ~/Code
+# High concurrency
+tmuxpull -j 16 ~/Code
 
 # Just print what would happen
 tmuxpull --dry-run ~/Projects
 
-# Verbose output showing commit messages  
+# Verbose output showing incoming commit messages
 tmuxpull -v ~/Workspaces
 ```
 
 ## Output
 
-Per-repo summary lines:
+Per-repo summary lines, printed as each repo finishes:
+
 ```
-my-project        ✓ 3 commits  8 files changed, 213 insertions(+), 41 deletions(-)
-other-repo        · up to date
-broken-thing      ✗ FAIL: could not apply autostash
+on-main-ff        + 1 commit  1 file changed, 1 insertion(+)
+on-main-replay    ~ rebased 1 onto main, pulled 1 commit  1 file changed, 1 insertion(+)
+feat-unpushed     ~ rebased 1 onto main, main +1  1 file changed, 1 insertion(+)
+up-to-date-repo   = up to date
+feat-pushed       ! DIVERGES from main: 1 file would conflict (main +1)
+feat-conflict     ! CONFLICT: rebase stopped, 1 file -- resolve here (main +1)
+broken-remote     ! FAIL: could not read from remote repository
+quiet             - ignored (git config tmuxpull.ignore)
+no-remote         - no remote
 ```
 
-After the rebase finishes, if you're on a TTY you get an **interactive session picker**: use ↑/↓ (or `j`/`k`), Enter to `tmux attach` straight into the chosen session, `q`/Esc to skip. Failed repos are listed first and highlighted red so they're the natural first pick. Inside an existing tmux client this becomes `tmux switch-client` (nested `attach` is refused). When output is piped or redirected the picker is skipped and the full `tmux attach -t <name>` list is printed instead, so scripts and CI still work.
+`!` lines go to stderr and mean you have to act; `+`/`~`/`=`/`-` go to stdout.
+The exit code is 1 when anything needs attention.
+
+### The result list outlives the handoff
+
+Choosing a tmux session used to cost you the summary — the process was replaced
+by tmux and nothing survived a detach. Now three things persist it:
+
+1. **An attention block on stderr** before tmux takes the terminal, so it stays
+   in the launching shell's scrollback:
+
+   ```
+   2 of 9 repos need attention:
+     feat-pushed    ! DIVERGES from main: 1 file would conflict (main +1)
+                    tmux attach -t Projects/feat-pushed
+     feat-conflict  ! CONFLICT: rebase stopped, 1 file -- resolve here (main +1)
+                    tmux attach -t Projects/feat-conflict
+   full report: ~/.local/state/tmuxpull/last-run.log
+   ```
+
+2. **A report file**, always written, whether or not you pick a session — every
+   repo, attention first, greppable by state (`grep '^\[conflict' last-run.log`).
+   It survives closing the terminal entirely.
+
+3. **A picker you come back to.** tmux runs as a child process, so detaching
+   returns you to the picker with the list reprinted: fix one repo, detach, pick
+   the next, `q` when you're done. Inside an existing tmux client this becomes
+   `tmux switch-client` (nested `attach` is refused) and control does not return.
+
+When output is piped or redirected the picker is skipped and the full
+`tmux attach -t <name>` list is printed instead, so scripts and CI still work.
+
+## Worktrees
+
+A repo and its worktrees (`repo` + `repo.wt/feat`) are separate directories, so a
+scan finds both — but they share **one object store and one ref namespace**.
+tmuxpull groups repos by `git rev-parse --git-common-dir` and serializes each
+group while running different groups in parallel, so concurrent jobs can't race
+on ref locks or `FETCH_HEAD`.
 
 ## Two Versions
 
@@ -113,30 +189,25 @@ After the rebase finishes, if you're on a TTY you get an **interactive session p
 The PyPI package (`src/tmuxpull/__init__.py`) is the canonical implementation.
 `bin/rebase-all.py` — the standalone PEP 723 script the curl one-liners use — is
 **generated from it** (`python scripts/gen_script.py`, or `mise run gen-script`);
-a test fails if the two drift, so they always ship identical behavior.
+a test fails if the two drift.
 
-- Rich per-repo summaries with git log output and diffstat
-- Better error handling and live progress reporting
-- Structured data model for repo state
-
-**Requirements**: Python 3.11+, tmux, git (plus [uv](https://docs.astral.sh/uv/) for the standalone script)
+**Requirements**: Python 3.11+, git 2.38+ (for `merge-tree --write-tree`), tmux,
+plus [uv](https://docs.astral.sh/uv/) for the standalone script
 
 ### `bin/rebase-all` (Fallback)
 
 - **Pure Zsh** — no Python dependencies
-- Same per-repo tmux sessions, same TTY session picker (arrow keys, failures
-  first, Enter attach / switch-client, q or Esc skip, piped-mode list print)
-- Same options: `-j`, `-d`, `-x`, `--tmux on/off`, `-v`/`-vv`, `--dry-run`,
-  plus the `git config tmuxpull.ignore` per-repo opt-out
-- Same summary shape: `+ N commits  <shortstat>`, `= up to date`, `! FAIL:`
+- Same branch handling, same report file, same attention block, same picker
+- Same options, including `--rebase-pushed`, `--log` / `--no-log`, and both
+  `git config tmuxpull.*` knobs
+- `tests/test_zsh_parity.py` builds one fixture per implementation and asserts
+  their summary lines are identical, so the two cannot drift silently
 
-> **Note on drift**: the Zsh port has been re-aligned to the Python version and
-> now matches its feature set. The one deliberate difference: summaries print
-> in input order at the end of the run (vs. Python's live completion-order
-> `[n/N]` counter). If the two ever drift again, the Python version wins as
-> source of truth.
+The one deliberate difference: summaries print in input order at the end of the
+run (vs. Python's live completion-order `[n/N]` counter). If the two ever
+disagree otherwise, the Python version is the source of truth.
 
-**Requirements**: Zsh, tmux, git
+**Requirements**: Zsh, git 2.38+, tmux
 
 ## Installation
 
@@ -172,11 +243,19 @@ ln -s $PWD/bin/rebase-all ~/.local/bin/
 
 ## Design
 
-Finds Git repos by walking the filesystem looking for `.git` directories, up to a configurable depth. Prunes common noise directories (`node_modules`, build artifacts, Python venvs) to avoid slow traversals.
+Finds Git repos by walking the filesystem looking for `.git` entries, up to a
+configurable depth. Prunes common noise directories (`node_modules`, build
+artifacts, Python venvs) to avoid slow traversals.
 
-Rebases run concurrently via `asyncio` (Python) or Zsh job control, capped at a reasonable limit to avoid overwhelming git servers. Each repo is isolated — failures don't stop other repos.
+Work runs concurrently via `asyncio` (Python) or Zsh job control, capped to
+avoid overwhelming git servers, and serialized per shared object store. Each
+repo is isolated — one failure doesn't stop the others.
 
-The tmux integration is the key workflow piece: clean repos just print their summary and disappear, while repos needing intervention (conflict resolution, stash conflicts, etc.) open interactive windows where you can fix things. `tmux attach -t rebase` becomes your "work queue" for the morning.
+The tmux integration is the key workflow piece: clean repos just print their
+summary and disappear, while repos needing intervention (conflict resolution,
+diverged branches) open interactive sessions where you fix things. The picker is
+your morning work queue, and the report file is what's left of it after you close
+the terminal.
 
 ## License
 

@@ -1,17 +1,36 @@
 #!/bin/zsh
 # rebase-all -- Zsh port of tmuxpull.
 #
-# Concurrent `git pull --rebase --autostash` across every Git repo under the
-# given roots. Prints a per-repo summary of what changed, creates a dedicated
-# tmux SESSION per repo landing on `git status`, and (on a TTY) drops you into
-# an interactive picker so you can Enter-attach the one you want to look at.
+# Keep every Git repo under the given roots in step with its remote, so merge
+# conflicts surface now instead of at push time. The default ("main"/head)
+# branch is the reference point, never whatever happens to be checked out.
+# Per repo, after a `git fetch --prune`:
+#
+#   * on the default branch     -> git pull --rebase --autostash
+#   * on a never-pushed branch  -> git rebase --autostash <remote>/<default>
+#   * on a pushed branch        -> detect only: the branch fast-forwards to its
+#                                  own upstream, and `git merge-tree` probes it
+#                                  against the new default branch without
+#                                  touching anything (rewriting pushed commits
+#                                  would cost you a --force-with-lease).
+#                                  Pass --rebase-pushed to rebase anyway.
+#   * detached HEAD             -> detect only
+#
+# The local default branch is also fast-forwarded by a plain ref update (no
+# checkout) whenever it is not the branch checked out here; when another
+# worktree owns it, that worktree's own run advances it.
+#
+# A conflicted rebase is left IN PROGRESS -- the repo's tmux session is where
+# you resolve it. Results go to a report file and the repos needing attention
+# are printed to stderr, so the list survives attaching and detaching.
 #
 # For richer summaries and identical output formatting, prefer the Python
-# version (bin/rebase-all.py, needs uv). Both scripts now share the same
-# per-repo-session tmux model and TTY picker UX.
+# version (bin/rebase-all.py, needs uv). Both scripts share the same branch
+# handling, report, per-repo-session tmux model and TTY picker UX.
 #
 # Usage:
-#   rebase-all [-j JOBS] [-d DEPTH] [-x GLOB] [--tmux on|off] [-v] [--dry-run] DIR [DIR...]
+#   rebase-all [-j JOBS] [-d DEPTH] [-x GLOB] [--tmux on|off] [--rebase-pushed]
+#              [--log PATH] [--no-log] [-v] [--dry-run] DIR [DIR...]
 
 set -uo pipefail
 
@@ -23,30 +42,42 @@ excludes=()
 tmux_mode="on"
 dry_run=false
 verbose=0
+rebase_pushed=false
+write_log=true
+log_path=""
+reflog_msg="tmuxpull: fast-forward to remote"
 
 usage() {
     cat >&2 <<'EOF'
 Usage: rebase-all [OPTIONS] DIR [DIR...]
 
-Concurrently `git pull --rebase --autostash` every git repo under the given
-roots. Print a per-repo summary, then create one tmux SESSION per repo
-landing on `git status`. On a TTY you get an interactive picker (arrow keys
-/ j-k to move, Enter to attach, q/Esc to skip); when output is piped, the
-list of `tmux attach` commands is printed instead.
+Bring every git repo under the given roots in step with its remote. A repo on
+its default branch is rebased in place; a repo on a never-pushed branch is
+replayed onto the default branch; a repo on a PUSHED branch is only probed for
+conflicts. Prints a per-repo summary, writes a report, then creates one tmux
+SESSION per repo landing on `git status`. On a TTY you get an interactive
+picker (arrow keys / j-k to move, Enter to attach, q/Esc to skip); detaching
+returns to the picker so the queue can be walked repo by repo.
 
 Options:
-  -j JOBS       Max concurrent rebases (default: 8)
-  -d DEPTH      Directory search depth (default: 2)
-  -x GLOB       Exclude repos whose display name matches this glob
-                (repeatable), e.g. -x 'kirodotdev/*'
-  --tmux MODE   on (default) or off
-  -v            Verbose: -v shows top 3 commit subjects per changed repo,
-                -vv shows all
-  --dry-run     List repos and exit
-  -h, --help    Show this help
+  -j JOBS          Max concurrent repos (default: 8)
+  -d DEPTH         Directory search depth (default: 2)
+  -x GLOB          Exclude repos whose display name matches this glob
+                   (repeatable), e.g. -x 'kirodotdev/*'
+  --tmux MODE      on (default) or off
+  --rebase-pushed  Also rebase pushed branches. Rewrites published commits,
+                   so the next push needs --force-with-lease.
+  --log PATH       Write the run report here
+                   (default: $XDG_STATE_HOME/tmuxpull/last-run.log)
+  --no-log         Do not write a report file
+  -v               Verbose: -v shows top 3 incoming commit subjects per repo,
+                   -vv shows all
+  --dry-run        List repos and exit
+  -h, --help       Show this help
 
-Per-repo sticky opt-out:
-  git -C /path/to/repo config tmuxpull.ignore true
+Per-repo git config:
+  git -C /path/to/repo config tmuxpull.ignore true          # skip entirely
+  git -C /path/to/repo config tmuxpull.defaultBranch NAME   # override default
 EOF
 }
 
@@ -56,6 +87,9 @@ while [[ $# -gt 0 ]]; do
         -d) max_depth=$2; shift 2 ;;
         -x) excludes+=("$2"); shift 2 ;;
         --tmux) tmux_mode=$2; shift 2 ;;
+        --rebase-pushed) rebase_pushed=true; shift ;;
+        --log) log_path=$2; write_log=true; shift 2 ;;
+        --no-log) write_log=false; shift ;;
         -v) ((verbose++)); shift ;;
         -vv) verbose=2; shift ;;
         --dry-run) dry_run=true; shift ;;
@@ -72,11 +106,18 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
+typeset -a roots
+roots=("$@")
+
+if [[ -z "$log_path" ]]; then
+    log_path="${XDG_STATE_HOME:-$HOME/.local/state}/tmuxpull/last-run.log"
+fi
+
 # --- repo discovery ------------------------------------------------------
 typeset -a repo_paths repo_names
 repo_paths=(); repo_names=()
 
-for root in "$@"; do
+for root in "${roots[@]}"; do
     if [[ ! -d "$root" ]]; then
         echo "skip: $root is not a directory" >&2
         continue
@@ -156,9 +197,8 @@ if [[ "$dry_run" == "true" ]]; then
 fi
 
 total=${#repo_paths[@]}
-echo "rebasing $total repo(s) (jobs=$jobs)..." >&2
+echo "updating $total repo(s) (jobs=$jobs)..." >&2
 
-# --- concurrent rebase ---------------------------------------------------
 tmpdir=$(mktemp -d)
 trap "rm -rf $tmpdir" EXIT
 
@@ -167,56 +207,356 @@ for name in "${repo_names[@]}"; do
     (( ${#name} > max_width )) && max_width=${#name}
 done
 
+# --- git helpers ---------------------------------------------------------
+
+plural() { (( $1 == 1 )) && printf '' || printf 's' }
+
+rev() { git -C "$1" rev-parse --verify --quiet "$2" 2>/dev/null || printf '' }
+
+count() { git -C "$1" rev-list --count "$2" 2>/dev/null || printf '0' }
+
+# 'origin' when the repo has it, else the first remote, else empty.
+pick_remote() {
+    local repo="$1" r first=""
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        if [[ "$r" == "origin" ]]; then printf 'origin'; return; fi
+        [[ -z "$first" ]] && first="$r"
+    done < <(git -C "$repo" remote 2>/dev/null)
+    printf '%s' "$first"
+}
+
+# tmuxpull.defaultBranch override, else the remote's published HEAD, else probe.
+resolve_default() {
+    local repo="$1" remote="$2" d head cand
+    d=$(git -C "$repo" config --get tmuxpull.defaultBranch 2>/dev/null) || d=""
+    if [[ -n "$d" ]]; then printf '%s' "$d"; return; fi
+    head=$(git -C "$repo" symbolic-ref --short -q "refs/remotes/$remote/HEAD" 2>/dev/null) || head=""
+    if [[ -n "$head" ]]; then printf '%s' "${head#$remote/}"; return; fi
+    for cand in main master trunk; do
+        if git -C "$repo" rev-parse --verify --quiet "refs/remotes/$remote/$cand" >/dev/null 2>&1; then
+            printf '%s' "$cand"; return
+        fi
+    done
+    printf ''
+}
+
+# True when <branch> is checked out in ANY worktree: its ref must be left alone.
+branch_checked_out() {
+    git -C "$1" worktree list --porcelain 2>/dev/null \
+        | grep -qxF "branch refs/heads/$2"
+}
+
+# True when a rebase is stopped mid-way in this worktree.
+rebase_in_progress() {
+    local repo="$1" n p
+    for n in rebase-merge rebase-apply; do
+        p=$(git -C "$repo" rev-parse --git-path $n 2>/dev/null) || continue
+        [[ -z "$p" ]] && continue
+        [[ "$p" != /* ]] && p="$repo/$p"
+        [[ -e "$p" ]] && return 0
+    done
+    return 1
+}
+
+# Would merging <base> into <tip> conflict? Entirely in memory: no checkout,
+# no index, no worktree, nothing to clean up. Prints conflicted paths.
+probe_conflicts() {
+    local repo="$1" base="$2" tip="$3" out rc
+    out=$(git -C "$repo" merge-tree --write-tree --name-only "$base" "$tip" 2>/dev/null)
+    rc=$?
+    (( rc == 0 )) && return 0          # clean
+    (( rc != 1 )) && return 2          # unrelated histories, or git too old
+    # drop the written tree's oid, stop at the blank line before the messages
+    print -r -- "$out" | tail -n +2 | awk 'NF==0{exit} {print}'
+    return 0
+}
+
+# --- per-repo work -------------------------------------------------------
+# zsh scopes dynamically, so these read rebase_one's locals directly.
+
+settle() {
+    if (( incoming > 0 || main_ff > 0 || branch_ff > 0 || main_created )); then
+        state=updated
+    else
+        state=clean
+    fi
+}
+
+compose_summary() {
+    local target=${default:-HEAD}
+    local -a parts
+    parts=()
+
+    case "$state" in
+        ignored)   printf -- '- ignored (git config tmuxpull.ignore)'; return ;;
+        no-remote) printf -- '- no remote'; return ;;
+        fail)      printf -- '! FAIL: %s' "$fail_msg"; return ;;
+    esac
+
+    (( replayed > 0 )) && parts+=("rebased $replayed onto $target")
+    if [[ "$action" == pull ]]; then
+        if (( incoming > 0 )); then
+            if (( replayed > 0 )); then
+                parts+=("pulled $incoming commit$(plural $incoming)")
+            else
+                parts+=("$incoming commit$(plural $incoming)")
+            fi
+        fi
+    elif (( main_ff > 0 )); then
+        parts+=("$target +$main_ff")
+    elif (( main_created )); then
+        parts+=("$target created")
+    elif (( incoming > 0 )); then
+        parts+=("$remote/$target +$incoming")
+    fi
+    (( main_diverged )) && parts+=("$target diverged locally")
+    (( branch_ff > 0 )) && parts+=("$branch +$branch_ff")
+
+    local n_confl=0
+    [[ -n "$conflicts" ]] && n_confl=$(print -r -- "$conflicts" | grep -c . )
+
+    if [[ "$state" == conflict || "$state" == diverged || "$state" == unsynced ]]; then
+        local head_txt
+        case "$state" in
+            conflict) head_txt="! CONFLICT: rebase stopped, $n_confl file$(plural $n_confl) -- resolve here" ;;
+            diverged) head_txt="! DIVERGES from $target: $n_confl file$(plural $n_confl) would conflict" ;;
+            unsynced) head_txt="! UNSYNCED: $branch and $upstream both moved" ;;
+        esac
+        # keep the movement note, minus the rebase that did not happen
+        local -a moved
+        moved=()
+        local p
+        for p in "${parts[@]}"; do
+            [[ "$p" == rebased\ * ]] && continue
+            moved+=("$p")
+        done
+        if (( ${#moved[@]} > 0 )); then
+            printf '%s (%s)' "$head_txt" "${(j:, :)moved}"
+        else
+            printf '%s' "$head_txt"
+        fi
+        return
+    fi
+
+    if (( ${#parts[@]} == 0 )); then
+        printf -- '= up to date'
+        return
+    fi
+    local lead='+'
+    (( replayed > 0 )) && lead='~'
+    if [[ -n "$shortstat" ]]; then
+        printf '%s %s  %s' "$lead" "${(j:, :)parts}" "$shortstat"
+    else
+        printf '%s %s' "$lead" "${(j:, :)parts}"
+    fi
+}
+
+finish() {
+    print -r -- "$state" > "$meta.state"
+    print -r -- "$(compose_summary)" > "$meta.summary"
+    print -rn -- "$conflicts" > "$meta.conflicts"
+}
+
+# A stopped rebase is a conflict to resolve; anything else is a failure.
+classify_failure() {
+    local tail_line
+    tail_line=$(tail -n1 "$meta.err" 2>/dev/null)
+    [[ -z "$tail_line" ]] && tail_line="git $action failed"
+    if rebase_in_progress "$repo"; then
+        state=conflict
+        conflicts=$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null)
+    else
+        state=fail
+        fail_msg="$tail_line"
+    fi
+    finish
+}
+
 rebase_one() {
     local i=$1
     local repo="${repo_paths[i]}"
-    local name="${repo_names[i]}"
     local slug=${repo//\//_}
-    local old_sha new_sha rc
+    local meta="$tmpdir/$slug"
+
+    local state=clean action=none branch="" remote="" default="" upstream=""
+    local fail_msg="" conflicts="" shortstat=""
+    local incoming=0 replayed=0 main_ff=0 branch_ff=0
+    local main_created=0 main_diverged=0
+    local before="" after="" remote_ref="" tip="" local_sha=""
+    local head_before="" head_after="" up="" head=""
+
+    branch=$(git -C "$repo" symbolic-ref --short -q HEAD 2>/dev/null) || branch=""
+    print -r -- "$branch" > "$meta.branch"
 
     # per-repo sticky opt-out
     local ign
     ign=$(git -C "$repo" config --get tmuxpull.ignore 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    if [[ "$ign" == "true" || "$ign" == "1" || "$ign" == "yes" || "$ign" == "on" ]]; then
-        echo "SKIPPED" > "$tmpdir/$slug.status"
-        echo "- ignored (git config tmuxpull.ignore)" > "$tmpdir/$slug.summary"
+    case "$ign" in
+        true|1|yes|on) state=ignored; finish; return ;;
+    esac
+
+    remote=$(pick_remote "$repo")
+    if [[ -z "$remote" ]]; then
+        state=no-remote; finish; return
+    fi
+    default=$(resolve_default "$repo" "$remote")
+    upstream=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || upstream=""
+
+    # 1. always pick up the latest remote state -- no side effects on your work
+    [[ -n "$default" ]] && remote_ref="refs/remotes/$remote/$default"
+    [[ -n "$remote_ref" ]] && before=$(rev "$repo" "$remote_ref")
+    if ! git -C "$repo" fetch --prune "$remote" >"$meta.out" 2>"$meta.err"; then
+        action=fetch
+        state=fail
+        fail_msg=$(tail -n1 "$meta.err" 2>/dev/null)
+        [[ -z "$fail_msg" ]] && fail_msg="git fetch failed"
+        finish
         return
     fi
-
-    old_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "")
-    if git -C "$repo" pull --rebase --autostash >"$tmpdir/$slug.out" 2>"$tmpdir/$slug.err"; then
-        rc=0
-        new_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "$old_sha")
-        echo "$rc" > "$tmpdir/$slug.status"
-        if [[ -n "$old_sha" && "$old_sha" != "$new_sha" ]]; then
-            local count shortstat plural
-            count=$(git -C "$repo" rev-list --count "$old_sha..$new_sha" 2>/dev/null || echo "0")
-            shortstat=$(git -C "$repo" diff --shortstat "$old_sha..$new_sha" 2>/dev/null | sed 's/^ *//')
-            plural=$([[ "$count" == "1" ]] && echo "" || echo "s")
-            if [[ -n "$shortstat" ]]; then
-                echo "+ $count commit$plural  $shortstat" > "$tmpdir/$slug.summary"
-            else
-                echo "+ $count commit$plural" > "$tmpdir/$slug.summary"
-            fi
-            git -C "$repo" log --oneline --no-decorate "$old_sha..$new_sha" > "$tmpdir/$slug.log" 2>/dev/null
-        else
-            echo "= up to date" > "$tmpdir/$slug.summary"
-        fi
-    else
-        rc=$?
-        echo "$rc" > "$tmpdir/$slug.status"
-        local err_tail
-        err_tail=$(tail -n1 "$tmpdir/$slug.err" 2>/dev/null || echo "exit $rc")
-        [[ -z "$err_tail" ]] && err_tail="exit $rc"
-        echo "! FAIL: $err_tail" > "$tmpdir/$slug.summary"
+    [[ -n "$remote_ref" ]] && after=$(rev "$repo" "$remote_ref")
+    if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
+        incoming=$(count "$repo" "$before..$after")
+        shortstat=$(git -C "$repo" diff --shortstat "$before..$after" 2>/dev/null | sed 's/^ *//')
+        git -C "$repo" log --oneline --no-decorate "$before..$after" > "$meta.log" 2>/dev/null
     fi
+
+    # 2. decide how much we are allowed to rewrite
+    local on_default=false
+    [[ -z "$default" || "$default" == "$branch" ]] && on_default=true
+    if [[ "$on_default" == true ]]; then
+        action=pull
+    elif [[ -z "$branch" ]]; then
+        action=detect                      # detached HEAD: nothing to rebase
+    elif [[ -z "$upstream" || "$rebase_pushed" == true ]]; then
+        action=rebase
+    else
+        action=detect                      # pushed: a rewrite costs a force-push
+    fi
+
+    # 3. keep the local default branch current for the next branch you cut
+    if [[ -n "$default" && "$on_default" == false ]]; then
+        tip=$(rev "$repo" "refs/remotes/$remote/$default")
+        if [[ -n "$tip" ]] && ! branch_checked_out "$repo" "$default"; then
+            local_sha=$(rev "$repo" "refs/heads/$default")
+            if [[ -z "$local_sha" ]]; then
+                if git -C "$repo" branch --track "$default" "$remote/$default" >/dev/null 2>&1; then
+                    main_created=1
+                fi
+            elif [[ "$local_sha" != "$tip" ]]; then
+                if git -C "$repo" merge-base --is-ancestor "$local_sha" "$tip" 2>/dev/null; then
+                    main_ff=$(count "$repo" "$local_sha..$tip")
+                    git -C "$repo" update-ref -m "$reflog_msg" \
+                        "refs/heads/$default" "$tip" "$local_sha" >/dev/null 2>&1 || main_ff=0
+                else
+                    main_diverged=1
+                fi
+            fi
+        fi
+    fi
+
+    # 4. align with the branch's own upstream before measuring against default
+    if [[ "$action" != pull && -n "$upstream" ]]; then
+        up=$(rev "$repo" "$upstream")
+        head=$(rev "$repo" HEAD)
+        if [[ -n "$up" && -n "$head" && "$up" != "$head" ]]; then
+            if git -C "$repo" merge-base --is-ancestor "$up" "$head" 2>/dev/null; then
+                :                          # merely ahead: normal unpushed work
+            elif git -C "$repo" merge-base --is-ancestor "$head" "$up" 2>/dev/null; then
+                branch_ff=$(count "$repo" "$head..$up")
+                if ! git -C "$repo" merge --ff-only "$upstream" >"$meta.out" 2>"$meta.err"; then
+                    branch_ff=0
+                    state=fail
+                    fail_msg=$(tail -n1 "$meta.err" 2>/dev/null)
+                    [[ -z "$fail_msg" ]] && fail_msg="git merge --ff-only failed"
+                    finish
+                    return
+                fi
+            else
+                # both sides moved: replaying only the local side would orphan
+                # the pushed commits, so this is yours to reconcile
+                state=unsynced
+                finish
+                return
+            fi
+        fi
+    fi
+
+    case "$action" in
+        pull)
+            local -a pull_args
+            pull_args=(pull --rebase --autostash)
+            # never-pushed default branch: name the remote explicitly
+            [[ -n "$default" && -z "$upstream" ]] && pull_args+=("$remote" "$default")
+            head_before=$(rev "$repo" HEAD)
+            if ! git -C "$repo" "${pull_args[@]}" >"$meta.out" 2>"$meta.err"; then
+                classify_failure
+                return
+            fi
+            head_after=$(rev "$repo" HEAD)
+            if [[ "$head_before" == "$head_after" ]]; then
+                settle
+            else
+                replayed=$(count "$repo" "refs/remotes/$remote/$default..HEAD")
+                if (( replayed > 0 )); then state=rebased; else state=updated; fi
+            fi
+            ;;
+        rebase)
+            head_before=$(rev "$repo" HEAD)
+            if ! git -C "$repo" rebase --autostash "$remote/$default" >"$meta.out" 2>"$meta.err"; then
+                classify_failure
+                return
+            fi
+            head_after=$(rev "$repo" HEAD)
+            if [[ "$head_before" == "$head_after" ]]; then
+                settle
+            else
+                replayed=$(count "$repo" "$remote/$default..HEAD")
+                state=rebased
+            fi
+            ;;
+        detect)
+            if [[ -z "$default" ]]; then
+                settle
+            else
+                conflicts=$(probe_conflicts "$repo" "$remote/$default" HEAD)
+                if [[ -n "$conflicts" ]]; then state=diverged; else settle; fi
+            fi
+            ;;
+    esac
+    finish
 }
 
-# fan out, up to $jobs concurrent
+# --- fan out, serialized per shared object store -------------------------
+# Worktrees share one object store and one ref namespace, so repos in the same
+# group must not run concurrently -- they would race on ref locks and
+# FETCH_HEAD. Groups run in parallel; members run in order.
+typeset -A group_members
+typeset -a group_keys
+group_keys=()
+for i in {1..$total}; do
+    key=$(git -C "${repo_paths[i]}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+        || key="${repo_paths[i]}"
+    [[ -z "$key" ]] && key="${repo_paths[i]}"
+    if [[ -z "${group_members[$key]-}" ]]; then
+        group_members[$key]="$i"
+        group_keys+=("$key")
+    else
+        group_members[$key]="${group_members[$key]} $i"
+    fi
+done
+
+run_group() {
+    local idx
+    for idx in ${=1}; do
+        rebase_one $idx
+    done
+}
+
 typeset -a pids
 pids=()
-for i in {1..$total}; do
-    rebase_one $i &
+for key in "${group_keys[@]}"; do
+    run_group "${group_members[$key]}" &
     pids+=($!)
     if (( ${#pids[@]} >= jobs )); then
         wait -n 2>/dev/null || true
@@ -230,22 +570,43 @@ for i in {1..$total}; do
 done
 wait
 
-# --- print results in input order ---------------------------------------
-fails=0
+# --- collect + print results in input order ------------------------------
+needs_attention() {
+    case "$1" in
+        conflict|diverged|unsynced|fail) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+wants_session() {
+    case "$1" in
+        ignored|no-remote) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+typeset -a states summaries branches
+states=(); summaries=(); branches=()
+attn_count=0
 for i in {1..$total}; do
-    repo="${repo_paths[i]}"
+    slug=${repo_paths[i]//\//_}
+    st=$(cat "$tmpdir/$slug.state" 2>/dev/null) || st="fail"
+    [[ -z "$st" ]] && st="fail"
+    sm=$(cat "$tmpdir/$slug.summary" 2>/dev/null) || sm="! FAIL: no result"
+    [[ -z "$sm" ]] && sm="! FAIL: no result"
+    br=$(cat "$tmpdir/$slug.branch" 2>/dev/null) || br=""
+    states+=("$st"); summaries+=("$sm"); branches+=("$br")
+    needs_attention "$st" && (( attn_count++ ))
+done
+
+for i in {1..$total}; do
     name="${repo_names[i]}"
-    slug=${repo//\//_}
-    st=$(cat "$tmpdir/$slug.status" 2>/dev/null || echo "999")
-    summary=$(cat "$tmpdir/$slug.summary" 2>/dev/null || echo "unknown")
-
-    if [[ "$st" == "0" || "$st" == "SKIPPED" ]]; then
-        printf "[%d/%d] %-${max_width}s  %s\n" "$i" "$total" "$name" "$summary"
+    slug=${repo_paths[i]//\//_}
+    if needs_attention "${states[i]}"; then
+        printf "[%d/%d] %-${max_width}s  %s\n" "$i" "$total" "$name" "${summaries[i]}" >&2
     else
-        printf "[%d/%d] %-${max_width}s  %s\n" "$i" "$total" "$name" "$summary" >&2
-        (( fails++ ))
+        printf "[%d/%d] %-${max_width}s  %s\n" "$i" "$total" "$name" "${summaries[i]}"
     fi
-
     if (( verbose > 0 )) && [[ -f "$tmpdir/$slug.log" ]]; then
         if (( verbose > 1 )); then cap=999999; else cap=3; fi
         shown=0
@@ -261,16 +622,7 @@ for i in {1..$total}; do
     fi
 done
 
-# --- tmux --------------------------------------------------------------
-if [[ "$tmux_mode" != "on" ]]; then
-    exit $((fails > 0 ? 1 : 0))
-fi
-
-if ! command -v tmux >/dev/null; then
-    echo "tmux not on PATH; skipping sessions" >&2
-    exit $((fails > 0 ? 1 : 0))
-fi
-
+# --- tmux sessions -------------------------------------------------------
 # Session name = "<parent>/<repo>" with ':', '.', space, tab -> '_'. tmux allows '/'.
 make_session_name() {
     local repo="$1"
@@ -289,70 +641,136 @@ make_session_name() {
     printf '%s' "$sname"
 }
 
-typeset -a session_names
-typeset -A session_failed
+typeset -a session_names sessions_of
+typeset -A session_attn
 session_names=()
-for i in {1..$total}; do
-    repo="${repo_paths[i]}"
-    slug=${repo//\//_}
-    st=$(cat "$tmpdir/$slug.status" 2>/dev/null || echo "999")
-    [[ "$st" == "SKIPPED" ]] && continue
+sessions_of=()
+for i in {1..$total}; do sessions_of+=(""); done
 
-    sname=$(make_session_name "$repo")
-    if tmux has-session -t "=$sname" 2>/dev/null; then
-        tmux new-window -t "=$sname:" -c "$repo" \; send-keys -t "=$sname:" 'git status' Enter >/dev/null 2>&1
+tmux_ok=false
+if [[ "$tmux_mode" == "on" ]]; then
+    if command -v tmux >/dev/null; then
+        tmux_ok=true
     else
-        tmux new-session -d -s "$sname" -c "$repo" \; send-keys -t "=$sname:" 'git status' Enter >/dev/null 2>&1
+        echo "tmux not on PATH; skipping sessions" >&2
     fi
-    session_names+=("$sname")
-    [[ "$st" != "0" ]] && session_failed[$sname]=1
-done
-
-if (( ${#session_names[@]} == 0 )); then
-    exit $((fails > 0 ? 1 : 0))
 fi
 
-# --- interactive picker (TTY-only) --------------------------------------
+if [[ "$tmux_ok" == true ]]; then
+    for i in {1..$total}; do
+        wants_session "${states[i]}" || continue
+        repo="${repo_paths[i]}"
+        sname=$(make_session_name "$repo")
+        if tmux has-session -t "=$sname" 2>/dev/null; then
+            tmux new-window -t "=$sname:" -c "$repo" \; send-keys -t "=$sname:" 'git status' Enter >/dev/null 2>&1
+        else
+            tmux new-session -d -s "$sname" -c "$repo" \; send-keys -t "=$sname:" 'git status' Enter >/dev/null 2>&1
+        fi
+        sessions_of[$i]="$sname"
+        session_names+=("$sname")
+        needs_attention "${states[i]}" && session_attn[$sname]=1
+    done
+fi
+
+# --- report file ---------------------------------------------------------
+# Ordered attention-first so the document opens on what still needs you.
+report_body() {
+    printf '# tmuxpull %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)"
+    printf '# roots: %s\n' "${roots[*]}"
+    printf '# %d repo(s), %d need attention\n\n' "$total" "$attn_count"
+    local pass i
+    for pass in attn rest; do
+        for i in {1..$total}; do
+            if [[ "$pass" == attn ]]; then
+                needs_attention "${states[i]}" || continue
+            else
+                needs_attention "${states[i]}" && continue
+            fi
+            local where="${branches[i]}"
+            [[ -z "$where" ]] && where="detached HEAD"
+            printf '[%-9s] %-*s  (%s)  %s\n' \
+                "${states[i]}" "$max_width" "${repo_names[i]}" "$where" "${summaries[i]}"
+            local slug=${repo_paths[i]//\//_}
+            if [[ -s "$tmpdir/$slug.conflicts" ]]; then
+                printf '             conflicts: %s\n' "$(tr '\n' ' ' < "$tmpdir/$slug.conflicts")"
+            fi
+            [[ -n "${sessions_of[i]}" ]] && printf '             tmux attach -t %s\n' "${sessions_of[i]}"
+            if [[ "${states[i]}" == fail && -s "$tmpdir/$slug.err" ]]; then
+                tail -n5 "$tmpdir/$slug.err" | while IFS= read -r line; do
+                    printf '             | %s\n' "$line"
+                done
+            fi
+        done
+    done
+    printf '\n'
+}
+
+log_file=""
+if [[ "$write_log" == true ]]; then
+    if mkdir -p "${log_path:h}" 2>/dev/null && report_body > "$log_path" 2>/dev/null; then
+        log_file="$log_path"
+    else
+        echo "could not write report to $log_path" >&2
+    fi
+fi
+
+# --- attention block -----------------------------------------------------
+# The durable reminder: printed before tmux takes the terminal, and again every
+# time it hands control back, so picking a session does not cost you the list.
+print_attention() {
+    if (( attn_count > 0 )); then
+        printf '\n%d of %d repo(s) need attention:\n' "$attn_count" "$total" >&2
+        local i
+        for i in {1..$total}; do
+            needs_attention "${states[i]}" || continue
+            printf '  %-*s  %s\n' "$max_width" "${repo_names[i]}" "${summaries[i]}" >&2
+            if [[ -n "${sessions_of[i]}" ]]; then
+                printf '  %-*s  tmux attach -t %s\n' "$max_width" "" "${sessions_of[i]}" >&2
+            else
+                printf '  %-*s  (no session)\n' "$max_width" "" >&2
+            fi
+        done
+    fi
+    [[ -n "$log_file" ]] && printf 'full report: %s\n' "$log_file" >&2
+}
+
+print_attention
+
+if (( ${#session_names[@]} == 0 )); then
+    exit $((attn_count > 0 ? 1 : 0))
+fi
+
+# Non-interactive (piped/redirected): print the full list instead of a picker.
 if [[ ! -t 0 || ! -t 1 ]]; then
     echo >&2
     echo "${#session_names[@]} tmux session(s) created:" >&2
     for n in ${(o)session_names}; do
         echo "  tmux attach -t $n" >&2
     done
-    exit $((fails > 0 ? 1 : 0))
+    exit $((attn_count > 0 ? 1 : 0))
 fi
 
-# Ordered list: failures first (alpha), then clean (alpha).
-typeset -a fail_sorted ok_sorted ordered
-fail_sorted=(); ok_sorted=()
+# --- interactive picker --------------------------------------------------
+# Ordered list: attention first (alpha), then the rest (alpha).
+typeset -a attn_sorted ok_sorted ordered
+attn_sorted=(); ok_sorted=()
 for n in ${(o)session_names}; do
-    if [[ -n "${session_failed[$n]-}" ]]; then
-        fail_sorted+=("$n")
+    if [[ -n "${session_attn[$n]-}" ]]; then
+        attn_sorted+=("$n")
     else
         ok_sorted+=("$n")
     fi
 done
-ordered=("${fail_sorted[@]}" "${ok_sorted[@]}")
+ordered=("${attn_sorted[@]}" "${ok_sorted[@]}")
 n_ordered=${#ordered[@]}
-n_fail=${#fail_sorted[@]}
-
-stty_orig=$(stty -g)
-term_cleaned=0
-cleanup_term() {
-    (( term_cleaned )) && return
-    term_cleaned=1
-    stty "$stty_orig" 2>/dev/null
-    printf '\e[?25h\e[0m'  # show cursor, reset attributes
-}
-trap 'cleanup_term' EXIT INT TERM
-stty -icanon -echo min 1 time 0
-printf '\e[?25l'  # hide cursor
+n_attn=${#attn_sorted[@]}
 
 idx=1
 top=1
+picked=""
+
 render() {
-    local rows cols
-    local size
+    local rows cols size
     size=$(stty size 2>/dev/null || echo '24 80')
     rows=${size% *}
     cols=${size#* }
@@ -364,7 +782,7 @@ render() {
 
     printf '\e[H\e[2J'
     local hdr="tmuxpull: $n_ordered session(s)"
-    (( n_fail > 0 )) && hdr="$hdr, $n_fail need attention"
+    (( n_attn > 0 )) && hdr="$hdr, $n_attn need attention"
     hdr="$hdr. Up/Down (j/k) to move, Enter to attach, q/Esc to skip."
     printf '\e[1m%s\e[0m\n' "${hdr:0:cols}"
     local end=$((top + body_h - 1))
@@ -373,7 +791,7 @@ render() {
         local n="${ordered[j]}"
         local marker="  "
         local color=""
-        if [[ -n "${session_failed[$n]-}" ]]; then
+        if [[ -n "${session_attn[$n]-}" ]]; then
             marker="! "
             color=$'\e[31m'
         fi
@@ -384,53 +802,74 @@ render() {
     done
 }
 
-picked=""
-pick_action="skip"
-while true; do
-    render
-    local key rest2
-    if ! IFS= read -r -k1 key 2>/dev/null; then
-        pick_action="skip"; break
-    fi
-    case "$key" in
-        $'\e')
-            # ESC alone, or the start of an arrow sequence
-            if IFS= read -r -k1 -t 0.05 rest2 2>/dev/null; then
-                if [[ "$rest2" == '[' ]]; then
-                    local arrow
-                    IFS= read -r -k1 arrow 2>/dev/null || arrow=""
-                    case "$arrow" in
-                        A) (( idx-- )); (( idx < 1 )) && idx=$n_ordered ;;
-                        B) (( idx++ )); (( idx > n_ordered )) && idx=1 ;;
-                        H) idx=1 ;;
-                        F) idx=$n_ordered ;;
-                    esac
+# Sets $picked to a session name, or "" when the user skips.
+run_picker() {
+    picked=""
+    local stty_orig term_cleaned=0 key rest2 arrow
+    stty_orig=$(stty -g)
+    cleanup_term() {
+        (( term_cleaned )) && return
+        term_cleaned=1
+        stty "$stty_orig" 2>/dev/null
+        printf '\e[?25h\e[0m'   # show cursor, reset attributes
+    }
+    trap 'cleanup_term' INT TERM
+    stty -icanon -echo min 1 time 0
+    printf '\e[?25l'            # hide cursor
+
+    while true; do
+        render
+        if ! IFS= read -r -k1 key 2>/dev/null; then
+            break
+        fi
+        case "$key" in
+            $'\e')
+                # ESC alone, or the start of an arrow sequence
+                if IFS= read -r -k1 -t 0.05 rest2 2>/dev/null; then
+                    if [[ "$rest2" == '[' ]]; then
+                        IFS= read -r -k1 arrow 2>/dev/null || arrow=""
+                        case "$arrow" in
+                            A) (( idx-- )); (( idx < 1 )) && idx=$n_ordered ;;
+                            B) (( idx++ )); (( idx > n_ordered )) && idx=1 ;;
+                            H) idx=1 ;;
+                            F) idx=$n_ordered ;;
+                        esac
+                    fi
+                else
+                    break
                 fi
-            else
-                pick_action="skip"; break
-            fi
-            ;;
-        $'\n'|$'\r'|"")
-            # zsh under -k1 in raw mode returns Enter as '' or $'\r' depending on config
-            pick_action="pick"; picked="${ordered[idx]}"; break
-            ;;
-        q|Q) pick_action="skip"; break ;;
-        j) (( idx++ )); (( idx > n_ordered )) && idx=1 ;;
-        k) (( idx-- )); (( idx < 1 )) && idx=$n_ordered ;;
-        g) idx=1 ;;
-        G) idx=$n_ordered ;;
-    esac
+                ;;
+            $'\n'|$'\r'|"")
+                # under -k1 in raw mode Enter arrives as '' or $'\r'
+                picked="${ordered[idx]}"
+                break
+                ;;
+            q|Q) break ;;
+            j) (( idx++ )); (( idx > n_ordered )) && idx=1 ;;
+            k) (( idx-- )); (( idx < 1 )) && idx=$n_ordered ;;
+            g) idx=1 ;;
+            G) idx=$n_ordered ;;
+        esac
+    done
+
+    cleanup_term
+    trap - INT TERM   # keep the EXIT trap (tmpdir cleanup)
+}
+
+# Walk the queue: attach, and when tmux gives the terminal back, reprint the
+# list and offer the picker again. tmux runs as a CHILD (no exec), which is
+# what makes coming back possible. Inside an existing tmux client there is
+# nothing to come back to -- switch-client returns at once -- so hand over and
+# stop there.
+while true; do
+    run_picker
+    [[ -z "$picked" ]] && break
+    if [[ -n "${TMUX-}" ]]; then
+        tmux switch-client -t "=$picked"
+        break
+    fi
+    tmux attach -t "=$picked"
+    print_attention
 done
 
-cleanup_term
-trap - INT TERM  # keep EXIT (tmpdir cleanup) but drop int/term handlers
-
-if [[ "$pick_action" == "pick" && -n "$picked" ]]; then
-    if [[ -n "${TMUX-}" ]]; then
-        exec tmux switch-client -t "=$picked"
-    else
-        exec tmux attach -t "=$picked"
-    fi
-fi
-
-exit $((fails > 0 ? 1 : 0))
+exit $((attn_count > 0 ? 1 : 0))

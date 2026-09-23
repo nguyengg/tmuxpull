@@ -1,9 +1,15 @@
-"""Tests for repo ignore mechanisms: -x/--exclude globs and Result.skipped."""
+"""Tests for repo ignore mechanisms: -x/--exclude globs and skipped states."""
 from __future__ import annotations
 
 from pathlib import Path
 
-from tmuxpull import Repo, Result, apply_excludes
+from tmuxpull import (
+    STATE_IGNORED,
+    STATE_NO_REMOTE,
+    Repo,
+    Result,
+    apply_excludes,
+)
 
 
 def _repo(name: str) -> Repo:
@@ -38,9 +44,17 @@ def test_apply_excludes_multiple_patterns():
     assert len(excluded) == 2
 
 
-def test_skipped_result_summary_and_flags():
-    r = Result(repo=_repo("a/x"), returncode=0, stdout="", stderr="", skipped=True)
+def test_ignored_result_summary_and_flags():
+    r = Result(repo=_repo("a/x"), state=STATE_IGNORED)
     assert r.ok
     assert not r.needs_attention
-    assert not r.changed
+    assert not r.wants_session
     assert r.summary_line() == "- ignored (git config tmuxpull.ignore)"
+
+
+def test_no_remote_result_summary_and_flags():
+    r = Result(repo=_repo("a/x"), state=STATE_NO_REMOTE)
+    assert r.ok
+    assert not r.needs_attention
+    assert not r.wants_session
+    assert r.summary_line() == "- no remote"
