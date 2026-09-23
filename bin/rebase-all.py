@@ -60,6 +60,12 @@ from typing import Iterable
 import libtmux
 
 
+# Single source of truth for the version: pyproject.toml reads it from here
+# (hatch dynamic version), so the PyPI package, the generated standalone script
+# and `--version` can never disagree.
+__version__ = "0.2.0"
+
+
 # Directories that are never a repo we want to descend into.
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -923,6 +929,32 @@ async def _run(repos: list[Repo], jobs: int, verbose: int, opts: Options) -> lis
     return results
 
 
+def version_line() -> str:
+    """Version plus the file it is running from.
+
+    The path matters as much as the number: the same machine can have a PyPI
+    install, a `uv tool` install and a curl'd standalone script on PATH, and
+    this says which one you just ran.
+    """
+    return f"tmuxpull {__version__} ({Path(__file__).resolve()})"
+
+
+class _VersionAction(argparse.Action):
+    """Print version_line() verbatim.
+
+    argparse's built-in "version" action runs its text through the help
+    formatter, which re-wraps at terminal width and splits the path onto its
+    own line -- so `--version` output would depend on how wide the window is.
+    """
+
+    def __init__(self, option_strings: list[str], dest: str, **kw: object) -> None:
+        super().__init__(option_strings, dest, nargs=0, **kw)  # type: ignore[arg-type]
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:  # noqa: ANN001
+        print(version_line())
+        parser.exit()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="tmuxpull",
@@ -940,6 +972,12 @@ def main() -> None:
             "(detection order: this override, refs/remotes/<remote>/HEAD, then "
             "main/master/trunk)."
         ),
+    )
+    ap.add_argument(
+        "-V",
+        "--version",
+        action=_VersionAction,
+        help="Show the version and which copy is running, then exit.",
     )
     ap.add_argument(
         "-d",

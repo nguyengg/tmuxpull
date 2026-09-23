@@ -94,6 +94,40 @@ tmuxpull [-d DEPTH] [-j JOBS] [--tmux {on,off}] [--rebase-pushed]
 - `--no-log` — Don't write a report file
 - `-v, --verbose` — Show incoming commit subjects (`-v` = top 3, `-vv` = all)
 - `--dry-run` — List repos that would be processed, then exit
+- `-V, --version` — Print the version and the file it's running from, then exit
+
+### Am I running the latest?
+
+```bash
+$ tmuxpull --version
+tmuxpull 0.2.0 (/home/you/.local/share/uv/tools/tmuxpull/lib/python3.14/site-packages/tmuxpull/__init__.py)
+```
+
+The path is there because one machine can easily have three copies on `PATH` —
+a `pip install` into whichever Python was current, a `uv tool install`, and a
+curl'd standalone script — and the version number alone won't tell you which one
+just ran. The second field is always the bare version, so `tmuxpull --version |
+awk '{print $2}'` is scriptable.
+
+Compare against what's published:
+
+```bash
+curl -s https://pypi.org/pypi/tmuxpull/json | grep -o '"version":"[^"]*"' | head -1
+```
+
+Upgrading depends on how it was installed:
+
+```bash
+uv tool upgrade tmuxpull      # uv tool install
+pip install -U tmuxpull       # pip install
+```
+
+A `pip install` into a version-managed Python (mise, pyenv, asdf) is worth
+avoiding: the package lives under that exact interpreter, so the next Python
+upgrade silently leaves it behind — or drops it off `PATH` entirely. `uv tool
+install tmuxpull` keeps it in its own environment instead. The curl one-liners
+need no upgrade at all: they read `main` directly, so they're current the moment
+a fix lands.
 
 ### Per-repo git config
 

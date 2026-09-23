@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tmuxpull"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Keep every git repo under a directory in step with its remote, concurrently, with a tmux session per repo that needs you"
 readme = "README.md"
 license = "MIT"
@@ -41,6 +41,10 @@ tmuxpull = "tmuxpull.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tmuxpull"]
+
+# One place to bump: src/tmuxpull/__init__.py's __version__.
+[tool.hatch.version]
+path = "src/tmuxpull/__init__.py"
 
 [tool.ruff]
 line-length = 120

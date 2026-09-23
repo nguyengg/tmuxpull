@@ -35,6 +35,8 @@
 set -uo pipefail
 
 # --- defaults ------------------------------------------------------------
+# Kept in step with src/tmuxpull/__init__.py's __version__ by a test.
+version="0.2.0"
 max_depth=2
 jobs=8
 typeset -a excludes
@@ -73,6 +75,7 @@ Options:
   -v               Verbose: -v shows top 3 incoming commit subjects per repo,
                    -vv shows all
   --dry-run        List repos and exit
+  -V, --version    Show the version and which copy is running, then exit
   -h, --help       Show this help
 
 Per-repo git config:
@@ -93,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         -v) ((verbose++)); shift ;;
         -vv) verbose=2; shift ;;
         --dry-run) dry_run=true; shift ;;
+        -V|--version) printf 'tmuxpull %s (%s)\n' "$version" "${0:A}"; exit 0 ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
